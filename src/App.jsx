@@ -1,5 +1,4 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
-import { db as firestoreDb, doc, setDoc, onSnapshot, collection, getDocs } from "./firebase.js";
 // ─── File storage for Notes (PDF/Word up to 10MB) — Supabase Storage ──────────
 // Firestore (above) stays as the database; only file blobs live in Supabase.
 // FILL IN the two values below from Supabase → Project Settings → API.
@@ -9,6 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://eoyrgfzczsvrntrzfjix.supabase.co";   // base project URL (no /rest/v1)
 const SUPABASE_ANON_KEY = "sb_publishable_nGyXeL2-Z703y1khOfTlqw_74KCifjR";  // publishable key (public, safe in client)
 const SUPA_BUCKET = "notes";                               // create this bucket in Supabase → Storage
+const DB_TABLE = "app_state";                              // the whole app database lives in ONE json row of this table
 const supabaseConfigured = !!SUPABASE_URL && !!SUPABASE_ANON_KEY
   && !SUPABASE_URL.includes("YOUR-PROJECT") && SUPABASE_ANON_KEY !== "YOUR-ANON-PUBLIC-KEY";
 const supabase = supabaseConfigured ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
@@ -295,23 +295,34 @@ export default function App(){
   const [user,setUser]=useState(null);
   const [toast,setToast]=useState(null);
 
-  // ── Firebase real-time listener ──────────────────────────────────────────
+  // ── Supabase database — whole app stored as ONE json row, with realtime sync ─
   useEffect(()=>{
-    const unsub=onSnapshot(doc(firestoreDb,"allbee","data"),(snap)=>{
-      if(snap.exists()){
-        setDb(snap.data());
-      } else {
-        // First run: seed the database
-        const seed=seedData();
-        setDoc(doc(firestoreDb,"allbee","data"),seed);
-        setDb(seed);
+    if(!supabase){ setLoading(false); setLoadFailed(true); return; }
+    let channel=null, cancelled=false;
+    (async()=>{
+      try{
+        const { data, error } = await supabase.from(DB_TABLE).select("data").eq("id","main").maybeSingle();
+        if(error) throw error;
+        if(data&&data.data){ if(!cancelled) setDb(data.data); }
+        else {
+          // First run: seed the database
+          const seed=seedData();
+          await supabase.from(DB_TABLE).upsert({id:"main",data:seed});
+          if(!cancelled) setDb(seed);
+        }
+        if(!cancelled){ setLoading(false); setLoadFailed(false); }
+      }catch(err){
+        console.error("Supabase DB error:",err);
+        if(!cancelled){ setLoading(false); setLoadFailed(true); }
       }
-      setLoading(false);setLoadFailed(false);
-    },(err)=>{
-      console.error("Firebase error:",err);
-      setLoading(false);setLoadFailed(true);
-    });
-    return()=>unsub();
+    })();
+    // Realtime: when the row changes on any device, update everyone.
+    channel=supabase.channel("app_state_rt")
+      .on("postgres_changes",{event:"*",schema:"public",table:DB_TABLE,filter:"id=eq.main"},(payload)=>{
+        if(payload.new&&payload.new.data) setDb(payload.new.data);
+      })
+      .subscribe();
+    return()=>{ cancelled=true; if(channel) supabase.removeChannel(channel); };
   },[]);
 
   // If data hasn't arrived after a while (slow/offline), let the user retry
@@ -325,13 +336,9 @@ export default function App(){
   const saveDb=useCallback((patch)=>{
     const n={...db,...patch};
     setDb(n);
-    try{
-      setDoc(doc(firestoreDb,"allbee","data"),stripUndefined(n))
-        .catch(err=>{console.error("Save failed:",err);notify("Couldn't save — "+(err?.code||err?.message||"check your connection"),"error");});
-    }catch(err){
-      console.error("Save failed (sync):",err);
-      notify("Couldn't save — "+(err?.message||"invalid data"),"error");
-    }
+    if(!supabase){ notify("Supabase isn't configured — set your URL and key at the top of App.jsx","error"); return; }
+    supabase.from(DB_TABLE).upsert({id:"main",data:stripUndefined(n)})
+      .then(({error})=>{ if(error){ console.error("Save failed:",error); notify("Couldn't save — "+(error.message||error.code||"check your connection"),"error"); } });
   },[db]);
 
   function notify(msg,type="success"){setToast({msg,type});setTimeout(()=>setToast(null),3000);}
