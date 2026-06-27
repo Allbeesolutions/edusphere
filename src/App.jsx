@@ -6,8 +6,8 @@ import { db as firestoreDb, doc, setDoc, onSnapshot, collection, getDocs } from 
 // The anon key is a PUBLIC key — safe to ship in client code; access is gated by
 // the Storage policies you add on the bucket (see setup notes).
 import { createClient } from "@supabase/supabase-js";
-const SUPABASE_URL = "https://YOUR-PROJECT.supabase.co";   // e.g. https://abcd1234.supabase.co
-const SUPABASE_ANON_KEY = "YOUR-ANON-PUBLIC-KEY";          // the "anon public" key
+const SUPABASE_URL = "https://eoyrgfzczsvrntrzfjix.supabase.co";   // base project URL (no /rest/v1)
+const SUPABASE_ANON_KEY = "sb_publishable_nGyXeL2-Z703y1khOfTlqw_74KCifjR";  // publishable key (public, safe in client)
 const SUPA_BUCKET = "notes";                               // create this bucket in Supabase → Storage
 const supabaseConfigured = !!SUPABASE_URL && !!SUPABASE_ANON_KEY
   && !SUPABASE_URL.includes("YOUR-PROJECT") && SUPABASE_ANON_KEY !== "YOUR-ANON-PUBLIC-KEY";
@@ -291,6 +291,7 @@ export default function App(){
   const C=dark?DARK:LIGHT;
   const [db,setDb]=useState(null);
   const [loading,setLoading]=useState(true);
+  const [loadFailed,setLoadFailed]=useState(false);
   const [user,setUser]=useState(null);
   const [toast,setToast]=useState(null);
 
@@ -305,13 +306,21 @@ export default function App(){
         setDoc(doc(firestoreDb,"allbee","data"),seed);
         setDb(seed);
       }
-      setLoading(false);
+      setLoading(false);setLoadFailed(false);
     },(err)=>{
       console.error("Firebase error:",err);
-      setLoading(false);
+      setLoading(false);setLoadFailed(true);
     });
     return()=>unsub();
   },[]);
+
+  // If data hasn't arrived after a while (slow/offline), let the user retry
+  // instead of waiting on an endless spinner. Clears itself once data loads.
+  useEffect(()=>{
+    if(db)return;
+    const t=setTimeout(()=>{ if(!db)setLoadFailed(true); },12000);
+    return()=>clearTimeout(t);
+  },[db]);
 
   const saveDb=useCallback((patch)=>{
     const n={...db,...patch};
@@ -327,6 +336,7 @@ export default function App(){
 
   function notify(msg,type="success"){setToast({msg,type});setTimeout(()=>setToast(null),3000);}
   function login(u,p,portalType){
+    if(!db) return "Still connecting to the server — please try again in a second.";
     if(portalType==="parent"){
       // parent logs in with the child's Roll No + the parent phone number on record
       const roll=String(u||"").trim().toLowerCase();
@@ -356,6 +366,7 @@ export default function App(){
   function logout(){setUser(null);}
   // Student self-registration — creates a PENDING request for admin approval
   function register(data){
+    if(!db) return "Still connecting — please try again in a second.";
     const reg={...data,id:uid(),status:"pending",createdAt:today(),requestedAt:new Date().toISOString()};
     saveDb({registrations:[...(db.registrations||[]),reg]});
     return null;
@@ -363,17 +374,10 @@ export default function App(){
   const myInst=user?.instId?db?.institutions?.find(i=>i.id===user.instId):null;
   const toastBg=toast?.type==="success"?C.teal:toast?.type==="error"?C.red:C.gold;
 
-  if(loading) return(
-    <div style={{minHeight:"100vh",background:"#f7f9fb",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16}}>
-      <img src={LOGO_SRC} alt="EduSphere" style={{width:90,objectFit:"contain",filter:"drop-shadow(0 0 16px #00bcd4aa)"}}/>
-      <div style={{fontSize:14,color:C.muted,fontWeight:600}}>Connecting to EduSphere…</div>
-      <div style={{width:220,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}><div style={{height:"100%",width:"60%",background:C.teal,borderRadius:99,animation:"slideIn 1.2s ease infinite"}}/></div>
-    </div>
-  );
   return <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Segoe UI',Inter,system-ui,sans-serif",fontSize:14,transition:"background 0.2s,color 0.2s"}}>
     <style>{`*{box-sizing:border-box;}::placeholder{color:${C.muted2};}@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}@keyframes indet{0%{left:-42%}100%{left:100%}}@keyframes fadeIn{from{opacity:0}to{opacity:1}}@keyframes slideIn{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:translateX(0)}}input:focus,select:focus,textarea:focus{outline:none;border-color:${C.teal}!important;box-shadow:0 0 0 3px ${C.teal}22!important;}button{cursor:pointer;transition:all 0.15s;font-family:inherit;}button:active{transform:scale(0.97);}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:${C.border2};border-radius:4px}`}</style>
     {toast&&<div style={{position:"fixed",top:18,right:18,zIndex:9999,padding:"12px 20px",borderRadius:10,fontWeight:600,fontSize:13,animation:"fadeIn 0.2s",boxShadow:C.shadowL,background:toastBg,color:"#fff"}}>{toast.type==="success"?"✓ ":toast.type==="error"?"✕ ":"⚠ "}{toast.msg}</div>}
-    {!user&&<LoginPage onLogin={login} onRegister={register} db={db} C={C} dark={dark} setDark={setDark}/>}
+    {!user&&<LoginPage onLogin={login} onRegister={register} db={db} ready={!!db} connError={!db&&loadFailed} C={C} dark={dark} setDark={setDark}/>}
     {user?.role==="superadmin"&&<SuperAdmin db={db} saveDb={saveDb} onLogout={logout} notify={notify} user={user} C={C} dark={dark} setDark={setDark}/>}
     {(user?.role==="admin"||user?.role==="staff"||user?.role==="accountant")&&myInst&&<InstDash db={db} saveDb={saveDb} onLogout={logout} notify={notify} user={user} inst={myInst} C={C} dark={dark} setDark={setDark}/>}
     {(user?.role==="student"||user?.role==="parent")&&<StudentPortal db={db} saveDb={saveDb} onLogout={logout} notify={notify} user={user} C={C} dark={dark} setDark={setDark} isParent={user?.role==="parent"}/>}
@@ -381,7 +385,7 @@ export default function App(){
 }
 
 // Login Page — Student first, Admin/Staff hidden
-function LoginPage({onLogin,onRegister,db,C,dark,setDark}){
+function LoginPage({onLogin,onRegister,db,ready,connError,C,dark,setDark}){
   const [showStaff,setShowStaff]=useState(false);
   const [portal,setPortal]=useState("student");
   const [regMode,setRegMode]=useState(false);
@@ -399,6 +403,12 @@ function LoginPage({onLogin,onRegister,db,C,dark,setDark}){
   const passLabel=portal==="parent"?"Parent Phone Number":portal==="student"?"Date of Birth (YYYY-MM-DD)":"Password";
   function go(){const e=onLogin(u,p,portal);if(e)setErr(e);else setErr("");}
   function sw(k){setPortal(k);setU("");setP("");setErr("");}
+  // Connection-aware sign-in button: shows "Connecting…" until data is ready,
+  // or a retry if the connection failed. Data loads in the background.
+  const signBusy=!ready&&!connError;
+  const signClick=connError?(()=>window.location.reload()):go;
+  const signLabel=(orig)=>connError?"⚠ Connection failed — Tap to retry":signBusy?"Connecting…":orig;
+  const signExtra=signBusy?{opacity:0.65,cursor:"wait"}:{};
   return(
     <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column"}}>
       <style>{`
@@ -472,7 +482,7 @@ function LoginPage({onLogin,onRegister,db,C,dark,setDark}){
               <div style={{fontSize:10,color:C.muted,marginTop:4}}>💡 Default password is your date of birth, e.g. 2005-03-14</div>
             </div>
             {err&&<div style={{background:C.redL,border:`1px solid ${C.red}44`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.red,marginBottom:14}}>⚠ {err}</div>}
-            <button className="sign-btn" onClick={go} style={{background:`linear-gradient(135deg,${C.purple},${C.purple}cc)`,color:"#fff",boxShadow:`0 4px 12px ${C.purple}44`}}>Sign In →</button>
+            <button className="sign-btn" onClick={signClick} disabled={signBusy} style={{background:`linear-gradient(135deg,${C.purple},${C.purple}cc)`,color:"#fff",boxShadow:`0 4px 12px ${C.purple}44`,...signExtra}}>{signLabel("Sign In →")}</button>
             <div style={{textAlign:"center",marginTop:14,paddingTop:14,borderTop:`1px solid ${C.border}`}}>
               <span style={{fontSize:11,color:C.muted}}>New student? </span>
               <button onClick={()=>{setRegMode(true);setErr("");}} style={{background:"none",border:"none",color:C.purple,fontSize:12,fontWeight:700,cursor:"pointer",textDecoration:"underline"}}>Register here →</button>
@@ -501,7 +511,7 @@ function LoginPage({onLogin,onRegister,db,C,dark,setDark}){
               <div style={{fontSize:10,color:C.muted,marginTop:4}}>💡 Use the phone number registered with your child's admission</div>
             </div>
             {err&&<div style={{background:C.redL,border:`1px solid ${C.red}44`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.red,marginBottom:14}}>⚠ {err}</div>}
-            <button className="sign-btn" onClick={go} style={{background:`linear-gradient(135deg,${C.gold},${C.gold}cc)`,color:"#fff",boxShadow:`0 4px 12px ${C.gold}44`}}>View Progress →</button>
+            <button className="sign-btn" onClick={signClick} disabled={signBusy} style={{background:`linear-gradient(135deg,${C.gold},${C.gold}cc)`,color:"#fff",boxShadow:`0 4px 12px ${C.gold}44`,...signExtra}}>{signLabel("View Progress →")}</button>
           </div>}
 
           {/* Staff/Admin panel — shown when expanded */}
@@ -524,7 +534,7 @@ function LoginPage({onLogin,onRegister,db,C,dark,setDark}){
               </div>
             </div>
             {err&&<div style={{background:C.redL,border:`1px solid ${C.red}44`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.red,marginBottom:14}}>⚠ {err}</div>}
-            <button className="sign-btn" onClick={go} style={{background:`linear-gradient(135deg,${pColor},${pColor}cc)`,color:"#fff",boxShadow:`0 4px 12px ${pColor}44`}}>Sign In →</button>
+            <button className="sign-btn" onClick={signClick} disabled={signBusy} style={{background:`linear-gradient(135deg,${pColor},${pColor}cc)`,color:"#fff",boxShadow:`0 4px 12px ${pColor}44`,...signExtra}}>{signLabel("Sign In →")}</button>
           </div>}
 
           {/* Small staff toggle link */}
