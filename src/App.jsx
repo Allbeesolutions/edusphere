@@ -4688,13 +4688,24 @@ function InstCertificates({students,inst,color,C}){
 // ─── PHASE 1: STUDENT AI CHAT ASSISTANT ─────────────────────────────────────
 function StuAIChat({stu:stuProp,inst,C}){
   const stu=stuProp&&typeof stuProp==="object"?stuProp:{};
-  const [msgs,setMsgs]=useState([{role:"assistant",text:`Hi ${stu?.name||"there"}! 👋 I'm your AI assistant. I can answer questions about your attendance, fees, homework, exams, and more. How can I help you today?`}]);
-  const [input,setInput]=useState("");const [loading,setLoading]=useState(false);
+  const [msgs,setMsgs]=useState([{role:"assistant",text:"Hi "+(stu.name||"there")+"! \ud83d\udc4b I'm your AI assistant. I can answer questions about your attendance, fees, homework, exams, and more. How can I help you today?"}]);
+  const [input,setInput]=useState("");
+  const [loading,setLoading]=useState(false);
   const endRef=useRef(null);
-  useEffect(()=>endRef.current?.scrollIntoView({behavior:"smooth"}),[msgs]);
-  // Everything below is derived from student data that arrives from the database in
-  // unpredictable shapes, so it is computed defensively: a failure here must never
-  // take down the whole section.
+
+  // NOTE: this effect MUST have a block body. With a concise arrow body it returns
+  // the result of scrollIntoView(), React stores that as the cleanup function and
+  // later calls it -> "n is not a function" thrown from React's commit phase.
+  useEffect(()=>{
+    try{
+      const el=endRef.current;
+      if(el&&typeof el.scrollIntoView==="function") el.scrollIntoView({behavior:"smooth"});
+    }catch(e){}
+    // return nothing on purpose
+  },[msgs]);
+
+  // Student data arrives from the database in unpredictable shapes, so everything
+  // derived from it is computed defensively.
   let attList=[],feeList=[],hwList=[],examList=[],att=0,totalFee=0,paidFee=0,dueFee=0,hwPending=0;
   try{
     attList=toArr(stu.attendance); feeList=toArr(stu.fees);
@@ -4707,62 +4718,73 @@ function StuAIChat({stu:stuProp,inst,C}){
     dueFee=totalFee-paidFee;
     for(let i=0;i<hwList.length;i++){ if(hwList[i]&&hwList[i].status==="Pending") hwPending++; }
   }catch(e){ try{console.error("AI Assistant data error:",e);}catch(x){} }
+
   const QUICK=[{l:"My attendance?",q:"What is my attendance percentage?"},{l:"Fee due?",q:"How much fee is pending for me?"},{l:"Homework?",q:"What homework is pending?"},{l:"My marks?",q:"Show me my exam marks and performance"}];
+
   async function send(text){
-    const q=text||input.trim();if(!q||loading)return;
-    setInput("");setMsgs(m=>[...m,{role:"user",text:q}]);setLoading(true);
-    const ctx=`You are a helpful AI assistant for student ${stu.name} at ${inst?.name||"the institution"}. Answer ONLY based on this student data:\n- Attendance: ${att}% (${attList.length} classes recorded)\n- Fee: Total ₹${totalFee}, Paid ₹${paidFee}, Due ₹${dueFee}\n- Homework pending: ${hwPending}\n- Exams: ${safeJson(examList.slice(0,5))}\n- Homework: ${safeJson(hwList.slice(0,5))}\n- Class/Course: ${stu.class||stu.course||stu.department||stu.danceStyle||"N/A"}\nBe friendly, brief, and helpful. If asked something not in data, say you don't have that info.`;
+    let q="";
+    try{ q=String(text||input||"").trim(); }catch(e){ q=""; }
+    if(!q||loading)return;
+    setInput("");
+    setMsgs(m=>m.concat([{role:"user",text:q}]));
+    setLoading(true);
     let answer="";
     try{
       if(!AI_PROXY_URL)throw new Error("offline");
+      const ctx="You are a helpful AI assistant for student "+(stu.name||"the student")+" at "+((inst&&inst.name)||"the institution")+
+        ". Answer ONLY based on this student data:\n- Attendance: "+att+"% ("+attList.length+" classes recorded)"+
+        "\n- Fee: Total \u20b9"+totalFee+", Paid \u20b9"+paidFee+", Due \u20b9"+dueFee+
+        "\n- Homework pending: "+hwPending+
+        "\n- Exams: "+safeJson(examList.slice(0,5))+
+        "\n- Homework: "+safeJson(hwList.slice(0,5))+
+        "\n- Class/Course: "+(stu.class||stu.course||stu.department||stu.danceStyle||"N/A")+
+        "\nBe friendly, brief, and helpful. If asked something not in data, say you don't have that info.";
       const res=await fetch(AI_PROXY_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:ctx+"\n\nQuestion: "+q})});
       if(!res.ok)throw new Error("offline");
       const d=await res.json();
-      answer=asText(d?.text)||asText(d?.content?.[0]?.text)||"";
+      answer=asText(d&&d.text)||asText(d&&d.content&&d.content[0]&&d.content[0].text)||"";
       if(!answer)throw new Error("empty");
     }catch(e){
       try{
-        answer=aiChatLocal(q,{name:stu.name,att,attCount:attList.length,total:totalFee,paid:paidFee,due:dueFee,hwPending,exams:examList,course:stu.class||stu.course||stu.department||stu.danceStyle||"your course"});
+        answer=aiChatLocal(q,{name:stu.name,att:att,attCount:attList.length,total:totalFee,paid:paidFee,due:dueFee,hwPending:hwPending,exams:examList,course:stu.class||stu.course||stu.department||stu.danceStyle||"your course"});
       }catch(err){
         answer="Sorry, I couldn't work that out just now. Try asking about your attendance, fees, homework or marks.";
       }
     }
-    setMsgs(m=>[...m,{role:"assistant",text:asText(answer)||"Sorry, I couldn't respond. Please try again."}]);
+    const finalText=asText(answer)||"Sorry, I couldn't respond. Please try again.";
+    setMsgs(m=>m.concat([{role:"assistant",text:finalText}]));
     setLoading(false);
   }
+
+  const initials=(String(stu.name||"").trim().split(/\s+/).filter(Boolean).map(w=>w[0]).slice(0,2).join("").toUpperCase())||"?";
+
   return <div style={{animation:"fadeUp 0.4s ease"}}>
-    <PH title="🤖 AI Assistant" sub="Ask anything about your studies, fees, attendance" C={C}/>
-    {/* Quick actions */}
+    <PH title="\ud83e\udd16 AI Assistant" sub="Ask anything about your studies, fees, attendance" C={C}/>
     <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-      {QUICK.map(q=><button key={q.l} onClick={()=>send(q.q)} style={{padding:"6px 14px",borderRadius:20,border:`1px solid ${C.border}`,background:C.surface,color:C.muted,fontSize:11,cursor:"pointer",transition:"all 0.15s"}} onMouseOver={e=>{e.target.style.borderColor=C.teal;e.target.style.color=C.teal;}} onMouseOut={e=>{e.target.style.borderColor=C.border;e.target.style.color=C.muted;}}>{q.l}</button>)}
+      {QUICK.map(q=><button key={q.l} onClick={()=>send(q.q)} style={{padding:"6px 14px",borderRadius:20,border:`1px solid ${C.border}`,background:C.surface,color:C.muted,fontSize:11,cursor:"pointer"}}>{q.l}</button>)}
     </div>
-    {/* Chat window */}
     <div style={{background:C.surface,borderRadius:12,border:`1px solid ${C.border}`,boxShadow:C.shadow,overflow:"hidden"}}>
       <div style={{height:380,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",gap:12}}>
-        {msgs.map((m,i)=><div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",gap:8}}>
-          {m.role==="assistant"&&<div style={{width:28,height:28,borderRadius:"50%",background:C.tealL,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>🤖</div>}
-          <div style={{maxWidth:"75%",padding:"10px 14px",borderRadius:m.role==="user"?"16px 16px 4px 16px":"16px 16px 16px 4px",background:m.role==="user"?C.teal:C.bg,color:m.role==="user"?"#fff":C.text,fontSize:13,lineHeight:1.5,border:m.role==="user"?"none":`1px solid ${C.border}`}}>
-            {asText(m.text)}
-          </div>
-          {m.role==="user"&&<Avatar name={stu.name} photo={stu.photo} color={C.teal} size={28} C={C}/>}
-        </div>)}
-        {loading&&<div style={{display:"flex",gap:8,alignItems:"center"}}><div style={{width:28,height:28,borderRadius:"50%",background:C.tealL,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>🤖</div><div style={{padding:"10px 14px",background:C.bg,borderRadius:"16px 16px 16px 4px",border:`1px solid ${C.border}`,fontSize:13,color:C.muted}}>Thinking...</div></div>}
+        {msgs.map((m,i)=>{
+          const isUser=m&&m.role==="user";
+          return <div key={i} style={{display:"flex",justifyContent:isUser?"flex-end":"flex-start",gap:8}}>
+            {!isUser&&<div style={{width:28,height:28,borderRadius:"50%",background:C.tealL,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>{"\ud83e\udd16"}</div>}
+            <div style={{maxWidth:"75%",padding:"10px 14px",borderRadius:isUser?"16px 16px 4px 16px":"16px 16px 16px 4px",background:isUser?C.teal:C.bg,color:isUser?"#fff":C.text,fontSize:13,lineHeight:1.5,border:isUser?"none":`1px solid ${C.border}`,whiteSpace:"pre-wrap"}}>
+              {asText(m&&m.text)}
+            </div>
+            {isUser&&<div style={{width:28,height:28,borderRadius:"50%",background:`${C.teal}18`,border:`2px solid ${C.teal}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:700,color:C.teal,flexShrink:0}}>{initials}</div>}
+          </div>;
+        })}
+        {loading&&<div style={{display:"flex",gap:8,alignItems:"center"}}><div style={{width:28,height:28,borderRadius:"50%",background:C.tealL,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>{"\ud83e\udd16"}</div><div style={{padding:"10px 14px",background:C.bg,borderRadius:"16px 16px 16px 4px",border:`1px solid ${C.border}`,fontSize:13,color:C.muted}}>Thinking...</div></div>}
         <div ref={endRef}/>
       </div>
       <div style={{borderTop:`1px solid ${C.border}`,padding:12,display:"flex",gap:10}}>
-        <Inp C={C} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()} placeholder="Ask about attendance, fees, homework..." style={{marginBottom:0,flex:1}}/>
-        <Btn onClick={()=>send()} C={C} color="teal" disabled={!input.trim()||loading}>Send →</Btn>
+        <Inp C={C} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Ask about attendance, fees, homework..." style={{marginBottom:0,flex:1}}/>
+        <Btn onClick={()=>send()} C={C} color="teal" disabled={!input.trim()||loading}>Send &rarr;</Btn>
       </div>
     </div>
   </div>;
 }
-
-
-// PHASE 2 FEATURES
-
-// PHASE 2 FEATURES
-
-// ─── LIBRARY MANAGEMENT ───────────────────────────────────────────────────────
 function InstLibrary({db,saveDb,inst,color,isAdmin,notify,C}){
   const KEY="lib_"+inst.id;
   const [books,setBooks]=useState(()=>lsGet(KEY,[]));
