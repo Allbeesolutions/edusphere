@@ -82,15 +82,37 @@ const LOGO_SRC="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABOYAAATmCAYAAACF/K
 const uid=()=>Math.random().toString(36).slice(2,10);
 const today=()=>new Date().toISOString().slice(0,10);
 const fmt=d=>d?d.split("-").reverse().join("/"):"--";
-const attPct=a=>{const L=Array.isArray(a)?a:(a&&typeof a==="object"?Object.values(a):[]);return !L.length?0:Math.round(L.filter(x=>x&&x.status==="Present").length/L.length*100);};
-// Records synced back from the database sometimes arrive as objects ({"0":{...}})
-// instead of arrays. toArr() makes list handling safe either way.
-const toArr=v=>Array.isArray(v)?v:(v&&typeof v==="object"?Object.values(v):[]);
-const num=v=>{const n=Number(v);return Number.isFinite(n)?n:0;};
-const money=v=>num(v).toLocaleString();
+// These are FUNCTION DECLARATIONS on purpose: they are hoisted, so they can never
+// be "not a function" no matter how the bundler orders or minifies the file.
+// (const arrow functions are NOT hoisted and caused a runtime crash in the build.)
+function toArr(v){
+  // Records synced back from the database sometimes arrive as objects ({"0":{...}})
+  // instead of arrays. toArr() makes list handling safe either way.
+  try{
+    if(Array.isArray(v)) return v;
+    if(v&&typeof v==="object") return Object.values(v);
+  }catch(e){}
+  return [];
+}
+function num(v){ var n=Number(v); return (typeof n==="number"&&isFinite(n))?n:0; }
+function money(v){ try{ return num(v).toLocaleString(); }catch(e){ return String(num(v)); } }
 // Never hand React an object as a child — that throws and unmounts the app.
-const asText=v=>typeof v==="string"?v:(v==null?"":(typeof v==="object"?(()=>{try{return JSON.stringify(v);}catch{return "";}})():String(v)));
-const safeJson=v=>{try{return JSON.stringify(v);}catch{return "[]";}};
+function asText(v){
+  try{
+    if(typeof v==="string") return v;
+    if(v===null||v===undefined) return "";
+    if(typeof v==="object") return JSON.stringify(v);
+    return String(v);
+  }catch(e){ return ""; }
+}
+function safeJson(v){ try{ return JSON.stringify(v); }catch(e){ return "[]"; } }
+function attPct(a){
+  var L=toArr(a);
+  if(!L.length) return 0;
+  var p=0;
+  for(var i=0;i<L.length;i++){ if(L[i]&&L[i].status==="Present") p++; }
+  return Math.round(p/L.length*100);
+}
 
 // Keeps one broken section from unmounting the entire app (the old white screen).
 class ErrorBoundary extends Component{
@@ -4670,14 +4692,21 @@ function StuAIChat({stu:stuProp,inst,C}){
   const [input,setInput]=useState("");const [loading,setLoading]=useState(false);
   const endRef=useRef(null);
   useEffect(()=>endRef.current?.scrollIntoView({behavior:"smooth"}),[msgs]);
-  // toArr() guards against fees/attendance/homework arriving as objects after a
-  // sync — previously that threw during render and blanked the whole app.
-  const attList=toArr(stu.attendance), feeList=toArr(stu.fees), hwList=toArr(stu.homeworks), examList=toArr(stu.exams);
-  const att=attPct(attList);
-  const totalFee=feeList.reduce((a,f)=>a+num(f?.amount),0);
-  const paidFee=feeList.reduce((a,f)=>a+num(f?.paid),0);
-  const dueFee=totalFee-paidFee;
-  const hwPending=hwList.filter(h=>h?.status==="Pending").length;
+  // Everything below is derived from student data that arrives from the database in
+  // unpredictable shapes, so it is computed defensively: a failure here must never
+  // take down the whole section.
+  let attList=[],feeList=[],hwList=[],examList=[],att=0,totalFee=0,paidFee=0,dueFee=0,hwPending=0;
+  try{
+    attList=toArr(stu.attendance); feeList=toArr(stu.fees);
+    hwList=toArr(stu.homeworks);   examList=toArr(stu.exams);
+    att=attPct(attList);
+    for(let i=0;i<feeList.length;i++){
+      const f=feeList[i]||{};
+      totalFee+=num(f.amount); paidFee+=num(f.paid);
+    }
+    dueFee=totalFee-paidFee;
+    for(let i=0;i<hwList.length;i++){ if(hwList[i]&&hwList[i].status==="Pending") hwPending++; }
+  }catch(e){ try{console.error("AI Assistant data error:",e);}catch(x){} }
   const QUICK=[{l:"My attendance?",q:"What is my attendance percentage?"},{l:"Fee due?",q:"How much fee is pending for me?"},{l:"Homework?",q:"What homework is pending?"},{l:"My marks?",q:"Show me my exam marks and performance"}];
   async function send(text){
     const q=text||input.trim();if(!q||loading)return;
