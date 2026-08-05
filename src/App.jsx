@@ -82,7 +82,7 @@ const LOGO_SRC="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABOYAAATmCAYAAACF/K
 const uid=()=>Math.random().toString(36).slice(2,10);
 const today=()=>new Date().toISOString().slice(0,10);
 const fmt=d=>d?d.split("-").reverse().join("/"):"--";
-const attPct=a=>!a?.length?0:Math.round(a.filter(x=>x.status==="Present").length/a.length*100);
+const attPct=a=>{const L=Array.isArray(a)?a:(a&&typeof a==="object"?Object.values(a):[]);return !L.length?0:Math.round(L.filter(x=>x&&x.status==="Present").length/L.length*100);};
 // Records synced back from the database sometimes arrive as objects ({"0":{...}})
 // instead of arrays. toArr() makes list handling safe either way.
 const toArr=v=>Array.isArray(v)?v:(v&&typeof v==="object"?Object.values(v):[]);
@@ -94,18 +94,28 @@ const safeJson=v=>{try{return JSON.stringify(v);}catch{return "[]";}};
 
 // Keeps one broken section from unmounting the entire app (the old white screen).
 class ErrorBoundary extends Component{
-  constructor(p){super(p);this.state={err:null};}
+  constructor(p){super(p);this.state={err:null,info:null};}
   static getDerivedStateFromError(err){return{err};}
-  componentDidCatch(err,info){try{console.error("Section crashed:",err,info);}catch{}}
-  componentDidUpdate(prev){if(prev.resetKey!==this.props.resetKey&&this.state.err)this.setState({err:null});}
+  componentDidCatch(err,info){try{console.error("Section crashed:",err,info);this.setState({info:(info&&info.componentStack)||""});}catch{}}
+  componentDidUpdate(prev){if(prev.resetKey!==this.props.resetKey&&this.state.err)this.setState({err:null,info:null});}
   render(){
     if(this.state.err){
       const C=this.props.C||{};
-      return <div style={{padding:"32px 20px",textAlign:"center",background:C.surface||"#fff",border:`1px solid ${C.border||"#e2e8f0"}`,borderRadius:12,margin:"8px 0"}}>
+      const e=this.state.err;
+      const detail=[String(e&&(e.message||e)),(e&&e.stack)||"",this.state.info||""].filter(Boolean).join("\n\n");
+      return <div style={{padding:"28px 20px",textAlign:"center",background:C.surface||"#fff",border:`1px solid ${C.border||"#e2e8f0"}`,borderRadius:12,margin:"8px 0"}}>
         <div style={{fontSize:30,marginBottom:10}}>⚠️</div>
         <div style={{fontWeight:700,fontSize:14,color:C.text||"#111",marginBottom:6}}>This section couldn't load</div>
-        <div style={{fontSize:12,color:C.muted||"#666",marginBottom:16}}>The rest of the app is still working — please try again or pick another menu item.</div>
-        <button onClick={()=>this.setState({err:null})} style={{padding:"8px 18px",borderRadius:6,border:`1px solid ${C.teal||"#0f766e"}`,background:C.teal||"#0f766e",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>Try again</button>
+        <div style={{fontSize:12,color:C.muted||"#666",marginBottom:14}}>The rest of the app is still working — please try again or pick another menu item.</div>
+        <div style={{fontSize:12,color:C.red||"#dc2626",fontFamily:"monospace",wordBreak:"break-word",background:C.bg||"#f7f9fb",border:`1px solid ${C.border||"#e2e8f0"}`,borderRadius:8,padding:"10px 12px",margin:"0 auto 14px",maxWidth:560,textAlign:"left"}}>{String(e&&(e.message||e))}</div>
+        <details style={{maxWidth:560,margin:"0 auto 14px",textAlign:"left"}}>
+          <summary style={{cursor:"pointer",fontSize:11,color:C.muted||"#666"}}>Technical details</summary>
+          <pre style={{fontSize:10,color:C.muted||"#666",whiteSpace:"pre-wrap",wordBreak:"break-word",maxHeight:220,overflow:"auto",marginTop:8}}>{detail}</pre>
+        </details>
+        <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
+          <button onClick={()=>this.setState({err:null,info:null})} style={{padding:"8px 18px",borderRadius:6,border:`1px solid ${C.teal||"#0f766e"}`,background:C.teal||"#0f766e",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>Try again</button>
+          <button onClick={()=>{try{navigator.clipboard.writeText(detail);}catch(x){}}} style={{padding:"8px 18px",borderRadius:6,border:`1px solid ${C.border||"#e2e8f0"}`,background:"transparent",color:C.muted||"#666",fontSize:13,fontWeight:600,cursor:"pointer"}}>Copy details</button>
+        </div>
       </div>;
     }
     return this.props.children;
@@ -186,7 +196,7 @@ function Btn({children,color="teal",outline=false,size="md",onClick,disabled=fal
 }
 function Badge({label,color="teal",C}){const col=tc(C,color),bg=tb(C,color);return <span style={{padding:"2px 9px",borderRadius:99,background:bg,color:col,fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",whiteSpace:"nowrap",border:`1px solid ${col}22`}}>{label}</span>;}
 function Avatar({name,photo,color,size=36,style:st={},C}){
-  const ini=name?.split(" ").map(w=>w[0]).slice(0,2).join("").toUpperCase()||"?";
+  const ini=String(name||"").trim().split(/\s+/).filter(Boolean).map(w=>w[0]).slice(0,2).join("").toUpperCase()||"?";
   if(photo)return <div style={{width:size,height:size,borderRadius:"50%",border:`2px solid ${color}44`,overflow:"hidden",flexShrink:0,...st}}><img src={photo} alt={name} style={{width:"100%",height:"100%",objectFit:"cover"}}/></div>;
   return <div style={{width:size,height:size,borderRadius:"50%",background:`${color}18`,border:`2px solid ${color}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*0.32,fontWeight:700,color,flexShrink:0,...st}}>{ini}</div>;
 }
@@ -4654,7 +4664,8 @@ function InstCertificates({students,inst,color,C}){
 }
 
 // ─── PHASE 1: STUDENT AI CHAT ASSISTANT ─────────────────────────────────────
-function StuAIChat({stu,inst,C}){
+function StuAIChat({stu:stuProp,inst,C}){
+  const stu=stuProp&&typeof stuProp==="object"?stuProp:{};
   const [msgs,setMsgs]=useState([{role:"assistant",text:`Hi ${stu?.name||"there"}! 👋 I'm your AI assistant. I can answer questions about your attendance, fees, homework, exams, and more. How can I help you today?`}]);
   const [input,setInput]=useState("");const [loading,setLoading]=useState(false);
   const endRef=useRef(null);
