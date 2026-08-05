@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback, Component } from "react";
 // ─── File storage for Notes (PDF/Word up to 10MB) — Supabase Storage ──────────
 // Firestore (above) stays as the database; only file blobs live in Supabase.
 // FILL IN the two values below from Supabase → Project Settings → API.
@@ -50,9 +50,6 @@ const DARK={
   inputBg:"#1e2426",
 };
 
-// AllBee Solutions — Computer Skills AI launcher URL
-const CS_AI_URL="https://ai.alimsahib.in/";
-
 const INST_TYPES=["College","School","Computer Institute","Dance School"];
 const TYPE_META={"College":{icon:"🎓"},"School":{icon:"🏫"},"Computer Institute":{icon:"💻"},"Dance School":{icon:"💃"}};
 const DEPARTMENTS={"Arts & Science":["Tamil","English","Mathematics","Physics","Chemistry","Computer Science","Economics","Commerce"],"Engineering":["CSE","ECE","EEE","Mechanical","Civil","IT","AIDS","AIML","Cyber Security"],"Medical":["MBBS","BDS","Nursing","Pharmacy","Physiotherapy"],"Management":["BBA","MBA","Finance","Marketing","HR"],"Law":["BA LLB","BBA LLB","LLM"]};
@@ -86,6 +83,34 @@ const uid=()=>Math.random().toString(36).slice(2,10);
 const today=()=>new Date().toISOString().slice(0,10);
 const fmt=d=>d?d.split("-").reverse().join("/"):"--";
 const attPct=a=>!a?.length?0:Math.round(a.filter(x=>x.status==="Present").length/a.length*100);
+// Records synced back from the database sometimes arrive as objects ({"0":{...}})
+// instead of arrays. toArr() makes list handling safe either way.
+const toArr=v=>Array.isArray(v)?v:(v&&typeof v==="object"?Object.values(v):[]);
+const num=v=>{const n=Number(v);return Number.isFinite(n)?n:0;};
+const money=v=>num(v).toLocaleString();
+// Never hand React an object as a child — that throws and unmounts the app.
+const asText=v=>typeof v==="string"?v:(v==null?"":(typeof v==="object"?(()=>{try{return JSON.stringify(v);}catch{return "";}})():String(v)));
+const safeJson=v=>{try{return JSON.stringify(v);}catch{return "[]";}};
+
+// Keeps one broken section from unmounting the entire app (the old white screen).
+class ErrorBoundary extends Component{
+  constructor(p){super(p);this.state={err:null};}
+  static getDerivedStateFromError(err){return{err};}
+  componentDidCatch(err,info){try{console.error("Section crashed:",err,info);}catch{}}
+  componentDidUpdate(prev){if(prev.resetKey!==this.props.resetKey&&this.state.err)this.setState({err:null});}
+  render(){
+    if(this.state.err){
+      const C=this.props.C||{};
+      return <div style={{padding:"32px 20px",textAlign:"center",background:C.surface||"#fff",border:`1px solid ${C.border||"#e2e8f0"}`,borderRadius:12,margin:"8px 0"}}>
+        <div style={{fontSize:30,marginBottom:10}}>⚠️</div>
+        <div style={{fontWeight:700,fontSize:14,color:C.text||"#111",marginBottom:6}}>This section couldn't load</div>
+        <div style={{fontSize:12,color:C.muted||"#666",marginBottom:16}}>The rest of the app is still working — please try again or pick another menu item.</div>
+        <button onClick={()=>this.setState({err:null})} style={{padding:"8px 18px",borderRadius:6,border:`1px solid ${C.teal||"#0f766e"}`,background:C.teal||"#0f766e",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>Try again</button>
+      </div>;
+    }
+    return this.props.children;
+  }
+}
 const tc=(C,color)=>color==="teal"?C.teal:color==="red"?C.red:color==="gold"?C.gold:color==="purple"?C.purple:color==="pink"?C.pink:color==="blue"?C.blue:color==="green"?C.green:C.teal;
 const tb=(C,color)=>color==="teal"?C.tealL:color==="red"?C.redL:color==="gold"?C.goldL:color==="purple"?C.purpleL:color==="pink"?C.pinkL:color==="blue"?C.blueL:color==="green"?C.greenL:C.tealL;
 // Local UI state helpers (timetable, receipts, alert log)
@@ -120,6 +145,7 @@ function seedData(){
     dailyUpdates:[],
     notifications:[],
     classLinks:[],
+    leaves:[],
     registrations:[],
     settings:{sheetUrl:"",sheetSecret:""},
   };
@@ -552,10 +578,7 @@ function LoginPage({onLogin,onRegister,db,ready,connError,C,dark,setDark}){
             }
           </div>}
 
-          <div style={{textAlign:"center",marginTop:14,fontSize:10,color:C.muted}}>Powered by <a href={CS_AI_URL} target="_blank" rel="noopener noreferrer" style={{color:C.teal,fontWeight:700,textDecoration:"none"}}>AllBee Solutions</a></div>
-          <div style={{textAlign:"center",marginTop:8}}>
-            <a href={CS_AI_URL} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:6,padding:"6px 14px",borderRadius:20,background:C.tealL,color:C.teal,fontSize:11,fontWeight:700,textDecoration:"none",border:`1px solid ${C.teal}33`}}>💻 Computer Skills AI ↗</a>
-          </div>
+          <div style={{textAlign:"center",marginTop:14,fontSize:10,color:C.muted}}>Powered by <span style={{color:C.teal,fontWeight:700}}>AllBee Solutions</span></div>
         </div>
       </div>
     </div>
@@ -1235,6 +1258,7 @@ function StudentPortal({db,saveDb,onLogout,notify,user,C,dark,setDark,isParent})
         </button>)}
       </div>
       <div className="inst-content">
+       <ErrorBoundary C={C} resetKey={tab}>
         {/* Mobile breadcrumb */}
         <div className="breadcrumb-bar" style={{background:C.surface,border:`1px solid ${C.border}`,marginBottom:14}}>
           <span style={{fontSize:16}}>{STABS.find(t=>t.k===tab)?.i}</span>
@@ -1261,15 +1285,6 @@ function StudentPortal({db,saveDb,onLogout,notify,user,C,dark,setDark,isParent})
             <StatCard icon="📚" label="HW Pending" value={stu.homeworks?.filter(h=>h.status==="Pending").length||0} color="purple" C={C} onClick={()=>setTab("homework")}/>
             <StatCard icon="📝" label="Exams Done" value={stu.exams?.length||0} color="blue" C={C} onClick={()=>setTab("marks")}/>
           </div>
-          {/* Computer Skills AI launcher */}
-          <a href={CS_AI_URL} target="_blank" rel="noopener noreferrer" style={{display:"flex",alignItems:"center",gap:14,padding:"16px 18px",borderRadius:12,marginBottom:16,textDecoration:"none",background:`linear-gradient(135deg,${C.teal},${C.tealD||C.teal})`,boxShadow:`0 4px 14px ${C.teal}44`}}>
-            <span style={{fontSize:30,flexShrink:0}}>💻</span>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontWeight:800,fontSize:15,color:"#fff"}}>Computer Skills AI</div>
-              <div style={{fontSize:11,color:"#ffffffdd",marginTop:2}}>Practice & learn with the AllBee Solutions AI tutor</div>
-            </div>
-            <span style={{flexShrink:0,padding:"7px 14px",borderRadius:20,background:"#ffffff2e",color:"#fff",fontSize:12,fontWeight:700}}>Open ↗</span>
-          </a>
         </div>}
         {/* ATTENDANCE */}
         {tab==="attendance"&&<div style={{animation:"fadeUp 0.4s ease"}}>
@@ -1358,6 +1373,7 @@ function StudentPortal({db,saveDb,onLogout,notify,user,C,dark,setDark,isParent})
         {tab==="settings"&&!isParent&&<StuSettings db={db} saveDb={saveDb} stu={stu} user={user} C={C} notify={notify}/>}
         {tab==="aichat"&&<StuAIChat stu={stu} inst={inst} C={C}/>}
         {tab==="leave"&&<StuLeaveView db={db} saveDb={saveDb} stu={stu} inst={inst} C={C} notify={notify}/>}
+       </ErrorBoundary>
       </div>
     </div>
   </div>;
@@ -2960,6 +2976,7 @@ function InstDash({db,saveDb,onLogout,notify,user,inst,C,dark,setDark}){
       </div>
       {/* Main content */}
       <div className="inst-content">
+       <ErrorBoundary C={C} resetKey={tab}>
         {/* Mobile breadcrumb */}
         <div className="breadcrumb-bar" style={{background:C.surface,border:`1px solid ${C.border}`}}>
           <span style={{fontSize:16}}>{curTab?.i}</span>
@@ -3005,6 +3022,7 @@ function InstDash({db,saveDb,onLogout,notify,user,inst,C,dark,setDark}){
         {tab==="docs"&&<InstDocs db={db} saveDb={saveDb} inst={inst} color={color} isAdmin={isAdmin} notify={notify} C={C}/>}
         {tab==="crm"&&<InstCRM db={db} saveDb={saveDb} user={user} inst={inst} isAdmin={isAdmin} color={color} notify={notify} C={C}/>}
         {tab==="gamify"&&<InstGamification students={myStudents} inst={inst} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
+       </ErrorBoundary>
       </div>
     </div>
   </div>;
@@ -4188,14 +4206,17 @@ function aiExamLocal({subject,topic}){
 
 // Offline responder — student chatbot
 function aiChatLocal(q,d){
-  const t=q.toLowerCase();
-  if(/\b(hi|hello|hey|vanakkam)\b/.test(t))return `Hi ${d.name}! 👋 Ask me about your attendance, fees, homework, marks or course.`;
-  if(/(attend|present|absent)/.test(t))return `Your attendance is ${d.att}% across ${d.attCount} recorded class(es). ${d.att>=75?"That's above the 75% requirement — keep it up! ✅":"That's below the 75% mark — try to attend regularly. ⚠️"}`;
-  if(/(fee|due|pay|payment|balance)/.test(t))return d.due>0?`Your total fee is ₹${d.total.toLocaleString()}, paid ₹${d.paid.toLocaleString()}, and ₹${d.due.toLocaleString()} is still pending. Please clear it at the office.`:`Your fees are fully paid (₹${d.paid.toLocaleString()}). Nothing pending — thank you! ✅`;
-  if(/(homework|hw|assignment)/.test(t))return d.hwPending>0?`You have ${d.hwPending} pending homework item(s). Check the Homework section for details and due dates.`:`No pending homework right now. 🎉`;
-  if(/(mark|exam|result|grade|score|percent)/.test(t)){if(!d.exams.length)return "No exam marks have been recorded yet.";const avg=Math.round(d.exams.reduce((a,e)=>a+(e.maxMarks>0?e.marks/e.maxMarks*100:Number(e.percentage)||0),0)/d.exams.length);return `You have ${d.exams.length} exam(s) recorded with an average of ${avg}%. ${avg>=60?"Good work — keep improving!":"Let's focus on revising weaker topics."}`;}
-  if(/(course|class|subject|study)/.test(t))return `You are enrolled in: ${d.course}. Let me know what you'd like to know about your studies.`;
-  return `I can help with your attendance (${d.att}%), fees (₹${d.due.toLocaleString()} due), homework (${d.hwPending} pending) and exam marks. Try asking "What is my attendance?" or "How much fee is due?".`;
+  const t=String(q||"").toLowerCase();
+  const name=d.name||"there", att=num(d.att), attCount=num(d.attCount);
+  const total=num(d.total), paid=num(d.paid), due=num(d.due), hwPending=num(d.hwPending);
+  const exams=toArr(d.exams);
+  if(/\b(hi|hello|hey|vanakkam)\b/.test(t))return `Hi ${name}! 👋 Ask me about your attendance, fees, homework, marks or course.`;
+  if(/(attend|present|absent)/.test(t))return `Your attendance is ${att}% across ${attCount} recorded class(es). ${att>=75?"That's above the 75% requirement — keep it up! ✅":"That's below the 75% mark — try to attend regularly. ⚠️"}`;
+  if(/(fee|due|pay|payment|balance)/.test(t))return due>0?`Your total fee is ₹${money(total)}, paid ₹${money(paid)}, and ₹${money(due)} is still pending. Please clear it at the office.`:`Your fees are fully paid (₹${money(paid)}). Nothing pending — thank you! ✅`;
+  if(/(homework|hw|assignment)/.test(t))return hwPending>0?`You have ${hwPending} pending homework item(s). Check the Homework section for details and due dates.`:`No pending homework right now. 🎉`;
+  if(/(mark|exam|result|grade|score|percent)/.test(t)){if(!exams.length)return "No exam marks have been recorded yet.";const avg=Math.round(exams.reduce((a,e)=>a+(num(e?.maxMarks)>0?num(e?.marks)/num(e?.maxMarks)*100:num(e?.percentage)),0)/exams.length);return `You have ${exams.length} exam(s) recorded with an average of ${avg}%. ${avg>=60?"Good work — keep improving!":"Let's focus on revising weaker topics."}`;}
+  if(/(course|class|subject|study)/.test(t))return `You are enrolled in: ${d.course||"your course"}. Let me know what you'd like to know about your studies.`;
+  return `I can help with your attendance (${att}%), fees (₹${money(due)} due), homework (${hwPending} pending) and exam marks. Try asking "What is my attendance?" or "How much fee is due?".`;
 }
 
 function InstAIHub({students,inst,color,onUpdate,notify,C}){
@@ -4634,29 +4655,39 @@ function InstCertificates({students,inst,color,C}){
 
 // ─── PHASE 1: STUDENT AI CHAT ASSISTANT ─────────────────────────────────────
 function StuAIChat({stu,inst,C}){
-  const [msgs,setMsgs]=useState([{role:"assistant",text:`Hi ${stu.name}! 👋 I'm your AI assistant. I can answer questions about your attendance, fees, homework, exams, and more. How can I help you today?`}]);
+  const [msgs,setMsgs]=useState([{role:"assistant",text:`Hi ${stu?.name||"there"}! 👋 I'm your AI assistant. I can answer questions about your attendance, fees, homework, exams, and more. How can I help you today?`}]);
   const [input,setInput]=useState("");const [loading,setLoading]=useState(false);
   const endRef=useRef(null);
   useEffect(()=>endRef.current?.scrollIntoView({behavior:"smooth"}),[msgs]);
-  const att=attPct(stu.attendance||[]);
-  const totalFee=stu.fees?.reduce((a,f)=>a+Number(f.amount||0),0)||0;
-  const paidFee=stu.fees?.reduce((a,f)=>a+Number(f.paid||0),0)||0;
+  // toArr() guards against fees/attendance/homework arriving as objects after a
+  // sync — previously that threw during render and blanked the whole app.
+  const attList=toArr(stu.attendance), feeList=toArr(stu.fees), hwList=toArr(stu.homeworks), examList=toArr(stu.exams);
+  const att=attPct(attList);
+  const totalFee=feeList.reduce((a,f)=>a+num(f?.amount),0);
+  const paidFee=feeList.reduce((a,f)=>a+num(f?.paid),0);
   const dueFee=totalFee-paidFee;
-  const hwPending=(stu.homeworks||[]).filter(h=>h.status==="Pending").length;
+  const hwPending=hwList.filter(h=>h?.status==="Pending").length;
   const QUICK=[{l:"My attendance?",q:"What is my attendance percentage?"},{l:"Fee due?",q:"How much fee is pending for me?"},{l:"Homework?",q:"What homework is pending?"},{l:"My marks?",q:"Show me my exam marks and performance"}];
   async function send(text){
     const q=text||input.trim();if(!q||loading)return;
     setInput("");setMsgs(m=>[...m,{role:"user",text:q}]);setLoading(true);
-    const ctx=`You are a helpful AI assistant for student ${stu.name} at ${inst?.name||"the institution"}. Answer ONLY based on this student data:\n- Attendance: ${att}% (${stu.attendance?.length||0} classes recorded)\n- Fee: Total ₹${totalFee}, Paid ₹${paidFee}, Due ₹${dueFee}\n- Homework pending: ${hwPending}\n- Exams: ${JSON.stringify((stu.exams||[]).slice(0,5))}\n- Homework: ${JSON.stringify((stu.homeworks||[]).slice(0,5))}\n- Class/Course: ${stu.class||stu.course||stu.department||stu.danceStyle||"N/A"}\nBe friendly, brief, and helpful. If asked something not in data, say you don't have that info.`;
+    const ctx=`You are a helpful AI assistant for student ${stu.name} at ${inst?.name||"the institution"}. Answer ONLY based on this student data:\n- Attendance: ${att}% (${attList.length} classes recorded)\n- Fee: Total ₹${totalFee}, Paid ₹${paidFee}, Due ₹${dueFee}\n- Homework pending: ${hwPending}\n- Exams: ${safeJson(examList.slice(0,5))}\n- Homework: ${safeJson(hwList.slice(0,5))}\n- Class/Course: ${stu.class||stu.course||stu.department||stu.danceStyle||"N/A"}\nBe friendly, brief, and helpful. If asked something not in data, say you don't have that info.`;
+    let answer="";
     try{
-      const res=await fetch(AI_PROXY_URL||"about:blank",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:ctx+"\n\nQuestion: "+q})});
-      if(!AI_PROXY_URL||!res.ok)throw new Error("offline");
+      if(!AI_PROXY_URL)throw new Error("offline");
+      const res=await fetch(AI_PROXY_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:ctx+"\n\nQuestion: "+q})});
+      if(!res.ok)throw new Error("offline");
       const d=await res.json();
-      setMsgs(m=>[...m,{role:"assistant",text:d.text||d.content?.[0]?.text||"Sorry, I couldn't respond. Try again."}]);
+      answer=asText(d?.text)||asText(d?.content?.[0]?.text)||"";
+      if(!answer)throw new Error("empty");
     }catch(e){
-      const ans=aiChatLocal(q,{name:stu.name,att,attCount:stu.attendance?.length||0,total:totalFee,paid:paidFee,due:dueFee,hwPending,exams:stu.exams||[],course:stu.class||stu.course||stu.department||stu.danceStyle||"your course"});
-      setMsgs(m=>[...m,{role:"assistant",text:ans}]);
+      try{
+        answer=aiChatLocal(q,{name:stu.name,att,attCount:attList.length,total:totalFee,paid:paidFee,due:dueFee,hwPending,exams:examList,course:stu.class||stu.course||stu.department||stu.danceStyle||"your course"});
+      }catch(err){
+        answer="Sorry, I couldn't work that out just now. Try asking about your attendance, fees, homework or marks.";
+      }
     }
+    setMsgs(m=>[...m,{role:"assistant",text:asText(answer)||"Sorry, I couldn't respond. Please try again."}]);
     setLoading(false);
   }
   return <div style={{animation:"fadeUp 0.4s ease"}}>
@@ -4671,7 +4702,7 @@ function StuAIChat({stu,inst,C}){
         {msgs.map((m,i)=><div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",gap:8}}>
           {m.role==="assistant"&&<div style={{width:28,height:28,borderRadius:"50%",background:C.tealL,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0}}>🤖</div>}
           <div style={{maxWidth:"75%",padding:"10px 14px",borderRadius:m.role==="user"?"16px 16px 4px 16px":"16px 16px 16px 4px",background:m.role==="user"?C.teal:C.bg,color:m.role==="user"?"#fff":C.text,fontSize:13,lineHeight:1.5,border:m.role==="user"?"none":`1px solid ${C.border}`}}>
-            {m.text}
+            {asText(m.text)}
           </div>
           {m.role==="user"&&<Avatar name={stu.name} photo={stu.photo} color={C.teal} size={28} C={C}/>}
         </div>)}
@@ -4855,19 +4886,44 @@ function InstPayroll({db,saveDb,inst,color,notify,C}){
 
 // ─── LEAVE MANAGEMENT ─────────────────────────────────────────────────────────
 function InstLeave({db,saveDb,user,inst,color,isAdmin,notify,C}){
-  const KEY="leave_"+inst.id;
-  const [leaves,setLeaves]=useState(()=>lsGet(KEY,[]));
+  // Leaves live in the SHARED database (db.leaves) so students, staff and admin
+  // all see the same records — across devices and browsers.
+  const allDbLeaves = Array.isArray(db?.leaves) ? db.leaves : [];
   const [subTab,setSubTab]=useState(isAdmin?"all":"apply");
   const [form,setForm]=useState({type:"Sick Leave",from:"",to:"",reason:""});
   const TYPES=["Sick Leave","Casual Leave","Emergency Leave","Medical Leave","Personal Leave"];
-  function saveLeaves(l){setLeaves(l);lsSet(KEY,l);}
-  function applyLeave(){if(!form.from||!form.to||!form.reason.trim())return;const days=Math.round((new Date(form.to)-new Date(form.from))/86400000)+1;saveLeaves([...leaves,{...form,id:uid(),applicantId:user.id,applicantName:user.name,role:user.role,days,status:"Pending",appliedAt:today()}]);setForm({type:"Sick Leave",from:"",to:"",reason:""});notify("Leave applied!");}
-  function approve(id){saveLeaves(leaves.map(l=>l.id===id?{...l,status:"Approved",reviewedAt:today(),reviewedBy:user.name}:l));notify("Leave approved!");}
-  function reject(id){saveLeaves(leaves.map(l=>l.id===id?{...l,status:"Rejected",reviewedAt:today(),reviewedBy:user.name}:l));notify("Leave rejected","error");}
-  const allLeaves=leaves.slice().sort((a,b)=>b.appliedAt.localeCompare(a.appliedAt));
+
+  // One-time migration: pull any leaves still sitting in this browser's
+  // localStorage (old storage) into the shared DB so nothing is lost.
+  useEffect(()=>{
+    if(!inst?.id||!db) return;
+    const old=[...lsGet("leave_"+inst.id,[]),...lsGet("leave_stu_"+inst.id,[])];
+    if(!old.length) return;
+    const have=new Set(allDbLeaves.map(l=>l.id));
+    const add=old.filter(l=>l&&l.id&&!have.has(l.id)).map(l=>normalizeLeave(l,inst.id));
+    if(add.length) saveDb({leaves:[...allDbLeaves,...add]});
+    lsSet("leave_"+inst.id,[]);lsSet("leave_stu_"+inst.id,[]);
+  },[inst?.id,!!db]);
+
+  function writeLeaves(next){ saveDb({leaves:next}); }
+  function applyLeave(){
+    if(!form.from||!form.to||!form.reason.trim())return;
+    if(form.to<form.from){notify("'To' date can't be before 'From' date","error");return;}
+    const days=Math.round((new Date(form.to)-new Date(form.from))/86400000)+1;
+    writeLeaves([...allDbLeaves,{...form,id:uid(),instId:inst.id,applicantId:user.id,applicantName:user.name,role:user.role||"staff",days,status:"Pending",appliedAt:today()}]);
+    setForm({type:"Sick Leave",from:"",to:"",reason:""});notify("Leave applied!");
+  }
+  function approve(id){writeLeaves(allDbLeaves.map(l=>l.id===id?{...l,status:"Approved",reviewedAt:today(),reviewedBy:user.name}:l));notify("Leave approved!");}
+  function reject(id){writeLeaves(allDbLeaves.map(l=>l.id===id?{...l,status:"Rejected",reviewedAt:today(),reviewedBy:user.name}:l));notify("Leave rejected","error");}
+
+  // Only this institution's leaves. Records saved before instId existed are kept visible.
+  const leaves=allDbLeaves.filter(l=>!l.instId||l.instId===inst.id);
+  const allLeaves=leaves.slice().sort((a,b)=>String(b.appliedAt||"").localeCompare(String(a.appliedAt||"")));
   const pending=allLeaves.filter(l=>l.status==="Pending");
-  const myLeaves=leaves.filter(l=>l.applicantId===user.id);
+  const myLeaves=allLeaves.filter(l=>l.applicantId===user.id);
   const statusColor=s=>s==="Approved"?C.green:s==="Rejected"?C.red:C.gold;
+  const who=l=>l.applicantName||l.studentName||"Unknown";
+  const roleOf=l=>l.role||(l.studentId?"student":"staff");
   const SUB=isAdmin?[{k:"all",l:"All Leaves"},{k:"pending",l:"Pending"+(pending.length?" ("+pending.length+")":"")},{k:"apply",l:"+ Apply"}]:[{k:"apply",l:"+ Apply Leave"},{k:"my",l:"My Leaves"}];
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="Leave Management" sub={pending.length+" pending approval"} C={C}/>
@@ -4890,11 +4946,11 @@ function InstLeave({db,saveDb,user,inst,color,isAdmin,notify,C}){
     {(subTab==="all"||subTab==="pending")&&isAdmin&&<div style={{display:"flex",flexDirection:"column",gap:10}}>
       {(subTab==="pending"?pending:allLeaves).map(l=><div key={l.id} style={{background:C.surface,borderRadius:10,border:"1px solid "+C.border,padding:"14px 18px",boxShadow:C.shadow,borderLeft:"4px solid "+statusColor(l.status)}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
-          <div><div style={{fontWeight:700,fontSize:13,color:C.text}}>{l.applicantName} <Badge label={l.role} color="teal" C={C}/></div><div style={{fontSize:12,color:C.muted,marginTop:3}}>{l.type} - {fmt(l.from)} to {fmt(l.to)} - {l.days} day(s)</div><div style={{fontSize:11,color:C.muted,marginTop:2,fontStyle:"italic"}}>{l.reason}</div></div>
+          <div><div style={{fontWeight:700,fontSize:13,color:C.text}}>{who(l)} <Badge label={roleOf(l)} color="teal" C={C}/>{l.rollNo?<span style={{fontSize:11,color:C.muted,fontWeight:500}}> · {l.rollNo}</span>:null}</div><div style={{fontSize:12,color:C.muted,marginTop:3}}>{l.type} - {fmt(l.from)} to {fmt(l.to)} - {l.days} day(s)</div><div style={{fontSize:11,color:C.muted,marginTop:2,fontStyle:"italic"}}>{l.reason}</div></div>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <Badge label={l.status} color={l.status==="Approved"?"green":l.status==="Rejected"?"red":"gold"} C={C}/>
             {l.status==="Pending"&&<><Btn onClick={()=>approve(l.id)} C={C} color="green" size="sm">Approve</Btn><Btn onClick={()=>reject(l.id)} C={C} color="red" size="sm" outline>Reject</Btn></>}
-            <Btn onClick={()=>saveLeaves(leaves.filter(x=>x.id!==l.id))} C={C} color="red" size="sm" outline>Del</Btn>
+            <Btn onClick={()=>writeLeaves(allDbLeaves.filter(x=>x.id!==l.id))} C={C} color="red" size="sm" outline>Del</Btn>
           </div>
         </div>
         {l.reviewedBy&&<div style={{fontSize:10,color:C.muted,marginTop:8}}>Reviewed by {l.reviewedBy} on {fmt(l.reviewedAt)}</div>}
@@ -4913,14 +4969,46 @@ function InstLeave({db,saveDb,user,inst,color,isAdmin,notify,C}){
   </div>;
 }
 
+// Bring an old localStorage leave record up to the shared shape used by admin.
+function normalizeLeave(l,instId){
+  return {...l,
+    instId:l.instId||instId,
+    applicantId:l.applicantId||l.studentId||l.staffId||"",
+    applicantName:l.applicantName||l.studentName||l.name||"Unknown",
+    role:l.role||(l.studentId?"student":"staff"),
+    status:l.status||"Pending",
+    appliedAt:l.appliedAt||today(),
+  };
+}
+
 function StuLeaveView({db,saveDb,stu,inst,C,notify}){
-  const KEY="leave_stu_"+inst.id;
-  const [leaves,setLeaves]=useState(()=>lsGet(KEY,[]));
+  // Same shared store the admin reads, so applications show up for approval.
+  const allDbLeaves = Array.isArray(db?.leaves) ? db.leaves : [];
   const [form,setForm]=useState({type:"Sick Leave",from:"",to:"",reason:""});
   const TYPES=["Sick Leave","Casual Leave","Emergency Leave","Medical Leave","Other"];
-  function saveLeaves(l){setLeaves(l);lsSet(KEY,l);}
-  function apply(){if(!form.from||!form.to||!form.reason.trim())return;const days=Math.round((new Date(form.to)-new Date(form.from))/86400000)+1;saveLeaves([...leaves,{...form,id:uid(),studentId:stu.id,studentName:stu.name,rollNo:stu.rollNo,days,status:"Pending",appliedAt:today()}]);setForm({type:"Sick Leave",from:"",to:"",reason:""});notify("Leave application submitted!");}
-  const myLeaves=leaves.filter(l=>l.studentId===stu.id).slice().sort((a,b)=>b.appliedAt.localeCompare(a.appliedAt));
+
+  // One-time migration of this student's older local-only applications.
+  useEffect(()=>{
+    if(!inst?.id||!db) return;
+    const old=lsGet("leave_stu_"+inst.id,[]);
+    if(!old.length) return;
+    const have=new Set(allDbLeaves.map(l=>l.id));
+    const add=old.filter(l=>l&&l.id&&!have.has(l.id)).map(l=>normalizeLeave(l,inst.id));
+    if(add.length) saveDb({leaves:[...allDbLeaves,...add]});
+    lsSet("leave_stu_"+inst.id,[]);
+  },[inst?.id,!!db]);
+
+  function apply(){
+    if(!form.from||!form.to||!form.reason.trim())return;
+    if(form.to<form.from){notify("'To' date can't be before 'From' date","error");return;}
+    const days=Math.round((new Date(form.to)-new Date(form.from))/86400000)+1;
+    saveDb({leaves:[...allDbLeaves,{...form,id:uid(),instId:inst.id,
+      applicantId:stu.id,applicantName:stu.name,role:"student",
+      studentId:stu.id,studentName:stu.name,rollNo:stu.rollNo,
+      days,status:"Pending",appliedAt:today()}]});
+    setForm({type:"Sick Leave",from:"",to:"",reason:""});notify("Leave application submitted!");
+  }
+  const myLeaves=allDbLeaves.filter(l=>(l.applicantId||l.studentId)===stu.id).slice().sort((a,b)=>String(b.appliedAt||"").localeCompare(String(a.appliedAt||"")));
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="Leave Application" sub="Apply and track your leave requests" C={C}/>
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
@@ -4946,6 +5034,7 @@ function StuLeaveView({db,saveDb,stu,inst,C,notify}){
     </div>
   </div>;
 }
+
 
 // ─── DOCUMENT MANAGEMENT ─────────────────────────────────────────────────────
 function InstDocs({db,saveDb,inst,color,isAdmin,notify,C}){
