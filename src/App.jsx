@@ -343,6 +343,149 @@ function stripUndefined(v){
   return v;
 }
 
+
+// ─── Safe saving ─────────────────────────────────────────────────────────────
+// The whole app lives in ONE database row. Previously every save wrote this
+// device's full copy of that row, so a phone or tab that had been open for a
+// few hours (and had missed live updates) silently wiped out everything other
+// people had added since. Now each save sends only the CHANGE: it re-reads the
+// latest row, merges this change into it, and writes it back only if nobody
+// else saved in between (otherwise it retries).
+const _isObj=v=>v!==null&&typeof v==="object"&&!Array.isArray(v);
+function _same(a,b){ if(a===b) return true; try{ return JSON.stringify(a)===JSON.stringify(b); }catch(e){ return false; } }
+function _idArr(a){ return Array.isArray(a)&&a.every(x=>_isObj(x)&&x.id!=null); }
+function _primArr(a){ return Array.isArray(a)&&a.every(x=>x===null||typeof x!=="object"); }
+function mergeById(base,mine,theirs){
+  const bm=new Map(base.map(x=>[x.id,x])), mm=new Map(mine.map(x=>[x.id,x]));
+  const out=[], seen=new Set();
+  for(const t of theirs){
+    seen.add(t.id);
+    const inBase=bm.has(t.id), inMine=mm.has(t.id);
+    if(inBase&&!inMine) continue;                         // removed on this device
+    out.push(inMine?mergeValue(bm.get(t.id),mm.get(t.id),t):t); // edited here, or added elsewhere
+  }
+  for(const m of mine){ if(!seen.has(m.id)&&!bm.has(m.id)) out.push(m); } // added on this device
+  return out;
+}
+function mergePrims(base,mine,theirs){
+  const removed=base.filter(x=>!mine.includes(x));
+  const added=mine.filter(x=>!base.includes(x));
+  const out=theirs.filter(x=>!removed.includes(x));
+  added.forEach(x=>{ if(!out.includes(x)) out.push(x); });
+  return out;
+}
+// 3-way merge: base = what this device saw, mine = base + this device's change,
+// theirs = what is on the server right now.
+function mergeValue(base,mine,theirs){
+  if(_same(mine,base)) return theirs;      // not changed here → keep the server's version
+  if(theirs===undefined||_same(theirs,base)) return mine; // not changed elsewhere → take ours
+  if(Array.isArray(mine)&&Array.isArray(theirs)){
+    const b=Array.isArray(base)?base:[];
+    if(_idArr(mine)&&_idArr(theirs)&&_idArr(b)) return mergeById(b,mine,theirs);
+    if(_primArr(mine)&&_primArr(theirs)&&_primArr(b)) return mergePrims(b,mine,theirs);
+    return mine;
+  }
+  if(_isObj(mine)&&_isObj(theirs)){
+    const b=_isObj(base)?base:{};
+    const out={...theirs};
+    const keys=new Set([...Object.keys(mine),...Object.keys(b)]);
+    keys.forEach(k=>{
+      if(!(k in mine)){ if(k in b&&_same(theirs[k],b[k])) delete out[k]; return; }
+      const v=mergeValue(b[k],mine[k],theirs[k]);
+      if(v===undefined) delete out[k]; else out[k]=v;
+    });
+    return out;
+  }
+  return mine;
+}
+const _sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function fetchServerDb(){
+  const { data, error } = await supabase.from(DB_TABLE).select("data").eq("id","main").maybeSingle();
+  if(error) throw error;
+  return data&&data.data?data.data:null;
+}
+// Write one change safely (compare-and-swap on the _rev counter, with retries).
+async function pushChange(base,mine){
+  let lastErr=null;
+  for(let attempt=0;attempt<8;attempt++){
+    try{
+      const server=await fetchServerDb();
+      if(!server) throw new Error("database row not found");
+      const hadRev=server._rev!==undefined&&server._rev!==null;
+      const rev=Number(server._rev)||0;
+      const merged=stripUndefined(mergeValue(base,mine,server));
+      merged._rev=rev+1; merged._savedAt=new Date().toISOString();
+      let q=supabase.from(DB_TABLE).update({data:merged}).eq("id","main");
+      q=hadRev?q.eq("data->>_rev",String(server._rev)):q.is("data->>_rev",null);
+      const { data:rows, error } = await q.select("id");
+      if(error) throw error;
+      if(rows&&rows.length) return merged;        // saved
+      lastErr=new Error("someone else saved at the same moment");
+    }catch(err){ lastErr=err; }
+    await _sleep(200*(attempt+1)+Math.random()*300); // conflict or network blip → retry
+  }
+  throw lastErr||new Error("could not reach the server");
+}
+
+// Lists that used to live only in one browser's localStorage (Timetable,
+// Online Exams, Library, Payroll, Documents) now live in the shared database,
+// so they show on every device and survive clearing the browser.
+function useInstList(db,saveDb,key,instId,legacyKey){
+  const all=toArr(db&&db[key]);
+  const items=all.filter(x=>x&&x.instId===instId);
+  useEffect(()=>{
+    if(!db||!instId||!legacyKey) return;
+    const old=toArr(lsGet(legacyKey,[]));
+    if(!old.length) return;
+    const have=new Set(all.map(x=>x&&x.id));
+    const add=old.filter(x=>x&&x.id&&!have.has(x.id)).map(x=>({...x,instId}));
+    if(add.length) saveDb({[key]:[...all,...add]});
+    lsSet(legacyKey+"_backup",old); lsSet(legacyKey,[]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[instId,!!db]);
+  function setItems(next){
+    saveDb({[key]:[...all.filter(x=>!x||x.instId!==instId),...toArr(next).map(x=>({...x,instId}))]});
+  }
+  return [items,setItems];
+}
+
+// ─── Generic edit dialog used by every "Edit" button ─────────────────────────
+// fields: [{k,label,type:"text"|"number"|"date"|"time"|"month"|"textarea"|"select",options,required,span,placeholder}]
+function EditModal({title,fields,value,onSave,onClose,C,saveLabel="Save changes",danger}){
+  const [f,setF]=useState(()=>({...(value||{})}));
+  const [err,setErr]=useState("");
+  const set=(k,v)=>setF(x=>({...x,[k]:v}));
+  useEffect(()=>{const h=e=>{if(e.key==="Escape")onClose();};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[onClose]);
+  function submit(){
+    for(const fd of fields){ if(fd.required&&!String(f[fd.k]??"").trim()){ setErr(`${fd.label.replace(/\s*\*$/,"")} is required`); return; } }
+    setErr(""); onSave(f);
+  }
+  const opt=o=>Array.isArray(o)?o:[o,o];
+  return <div role="dialog" aria-modal="true" aria-label={title} onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",padding:16,animation:"fadeIn 0.15s ease"}}>
+    <div onClick={e=>e.stopPropagation()} style={{background:C.surface,borderRadius:12,border:`1px solid ${C.border}`,boxShadow:C.shadowL,width:"100%",maxWidth:560,maxHeight:"90vh",overflowY:"auto",padding:22}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div style={{fontWeight:700,fontSize:15,color:C.text}}>{title}</div>
+        <button onClick={onClose} aria-label="Close" style={{background:"none",border:"none",color:C.muted,fontSize:22,lineHeight:1,cursor:"pointer"}}>×</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+        {fields.map(fd=><FG key={fd.k} label={fd.label} C={C} span={fd.span||fd.type==="textarea"}>
+          {fd.type==="textarea"?<Txt C={C} value={f[fd.k]??""} onChange={e=>set(fd.k,e.target.value)} rows={fd.rows||3} placeholder={fd.placeholder}/>
+          :fd.type==="select"?<Sel C={C} value={f[fd.k]??""} onChange={e=>set(fd.k,e.target.value)}>{(fd.options||[]).map(o=>{const [v,l]=opt(o);return <option key={v} value={v}>{l}</option>;})}</Sel>
+          :<Inp C={C} type={fd.type||"text"} value={f[fd.k]??""} onChange={e=>set(fd.k,e.target.value)} placeholder={fd.placeholder}/>}
+        </FG>)}
+      </div>
+      {err&&<div style={{marginTop:12,fontSize:12,color:C.red,fontWeight:600}}>{err}</div>}
+      {danger&&<div style={{marginTop:12,fontSize:11,color:C.muted}}>{danger}</div>}
+      <div style={{display:"flex",gap:10,marginTop:18}}>
+        <Btn onClick={submit} C={C} color="teal">{saveLabel}</Btn>
+        <Btn onClick={onClose} C={C} color="red" outline>Cancel</Btn>
+      </div>
+    </div>
+  </div>;
+}
+// small helper: replace one record (by id) inside a list
+function patchById(arr,id,patch){ return toArr(arr).map(x=>x&&x.id===id?{...x,...patch}:x); }
+
 // Root App
 export default function App(){
   const [dark,setDark]=useState(false);
@@ -353,21 +496,55 @@ export default function App(){
   const [user,setUser]=useState(null);
   const [toast,setToast]=useState(null);
 
+  // Local changes not yet confirmed by the server (re-applied on top of any
+  // fresh server copy so they don't flicker away while saving).
+  const pendingRef=useRef([]);
+  const queueRef=useRef(Promise.resolve());
+  const [saving,setSaving]=useState(0);
+  const applyServer=useCallback((server)=>{
+    if(!server) return;
+    let next=server;
+    for(const p of pendingRef.current) next=mergeValue(p.base,p.mine,next);
+    setDb(next);
+  },[]);
+  const refresh=useCallback(async()=>{
+    if(!supabase) return;
+    try{ const server=await fetchServerDb(); if(server) applyServer(server); }catch(e){ /* offline — try again later */ }
+  },[applyServer]);
+
+  // Keep every open device fresh: re-read when the tab/app comes back into
+  // view, when the internet reconnects, and every minute while visible.
+  useEffect(()=>{
+    const onVis=()=>{ if(document.visibilityState==="visible") refresh(); };
+    window.addEventListener("focus",refresh);
+    window.addEventListener("online",refresh);
+    document.addEventListener("visibilitychange",onVis);
+    const t=setInterval(()=>{ if(document.visibilityState==="visible") refresh(); },60000);
+    return()=>{ window.removeEventListener("focus",refresh); window.removeEventListener("online",refresh); document.removeEventListener("visibilitychange",onVis); clearInterval(t); };
+  },[refresh]);
+  // Warn before closing the tab while a save is still on its way.
+  useEffect(()=>{
+    const h=e=>{ if(pendingRef.current.length){ e.preventDefault(); e.returnValue=""; } };
+    window.addEventListener("beforeunload",h);
+    return()=>window.removeEventListener("beforeunload",h);
+  },[]);
+
   // ── Supabase database — whole app stored as ONE json row, with realtime sync ─
   useEffect(()=>{
     if(!supabase){ setLoading(false); setLoadFailed(true); return; }
     let channel=null, cancelled=false;
     (async()=>{
       try{
-        const { data, error } = await supabase.from(DB_TABLE).select("data").eq("id","main").maybeSingle();
-        if(error) throw error;
-        if(data&&data.data){ if(!cancelled) setDb(data.data); }
-        else {
-          // First run: seed the database
-          const seed=seedData();
-          await supabase.from(DB_TABLE).upsert({id:"main",data:seed});
-          if(!cancelled) setDb(seed);
+        let server=await fetchServerDb();
+        if(!server){
+          // First run only: create the row. ignoreDuplicates means this can
+          // NEVER overwrite an existing database (the old code could).
+          const seed={...seedData(),_rev:1};
+          await supabase.from(DB_TABLE).upsert({id:"main",data:seed},{onConflict:"id",ignoreDuplicates:true});
+          server=await fetchServerDb();
         }
+        if(!server) throw new Error("Could not create or read the database row");
+        if(!cancelled) applyServer(server);
         if(!cancelled){ setLoading(false); setLoadFailed(false); }
       }catch(err){
         console.error("Supabase DB error:",err);
@@ -377,9 +554,10 @@ export default function App(){
     // Realtime: when the row changes on any device, update everyone.
     channel=supabase.channel("app_state_rt")
       .on("postgres_changes",{event:"*",schema:"public",table:DB_TABLE,filter:"id=eq.main"},(payload)=>{
-        if(payload.new&&payload.new.data) setDb(payload.new.data);
+        if(payload.new&&payload.new.data) applyServer(payload.new.data);
+        else refresh(); // large rows can arrive without data — fetch it
       })
-      .subscribe();
+      .subscribe(status=>{ if(status==="SUBSCRIBED") refresh(); }); // re-sync after every reconnect
     return()=>{ cancelled=true; if(channel) supabase.removeChannel(channel); };
   },[]);
 
@@ -392,12 +570,24 @@ export default function App(){
   },[db]);
 
   const saveDb=useCallback((patch)=>{
-    const n={...db,...patch};
-    setDb(n);
+    if(!db) return;
     if(!supabase){ notify("Supabase isn't configured — set your URL and key at the top of App.jsx","error"); return; }
-    supabase.from(DB_TABLE).upsert({id:"main",data:stripUndefined(n)})
-      .then(({error})=>{ if(error){ console.error("Save failed:",error); notify("Couldn't save — "+(error.message||error.code||"check your connection"),"error"); } });
-  },[db]);
+    const base=db, mine={...db,...patch};
+    const change={base,mine};
+    pendingRef.current=[...pendingRef.current,change];
+    setDb(prev=>mergeValue(base,mine,prev||base));   // show it instantly
+    setSaving(n=>n+1);
+    queueRef.current=queueRef.current
+      .then(()=>pushChange(base,mine))
+      .then(saved=>{ pendingRef.current=pendingRef.current.filter(c=>c!==change); applyServer(saved); })
+      .catch(err=>{
+        console.error("Save failed:",err);
+        pendingRef.current=pendingRef.current.filter(c=>c!==change);
+        notify("Couldn't save your last change — "+((err&&(err.message||err.code))||"check your connection")+". Please try again.","error");
+        refresh();
+      })
+      .finally(()=>setSaving(n=>n-1));
+  },[db,applyServer,refresh]);
 
   function notify(msg,type="success"){setToast({msg,type});setTimeout(()=>setToast(null),3000);}
   function login(u,p,portalType){
@@ -442,6 +632,7 @@ export default function App(){
   return <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Segoe UI',Inter,system-ui,sans-serif",fontSize:14,transition:"background 0.2s,color 0.2s"}}>
     <style>{`*{box-sizing:border-box;}::placeholder{color:${C.muted2};}@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}@keyframes indet{0%{left:-42%}100%{left:100%}}@keyframes fadeIn{from{opacity:0}to{opacity:1}}@keyframes slideIn{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:translateX(0)}}input:focus,select:focus,textarea:focus{outline:none;border-color:${C.teal}!important;box-shadow:0 0 0 3px ${C.teal}22!important;}button{cursor:pointer;transition:all 0.15s;font-family:inherit;}button:active{transform:scale(0.97);}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:${C.border2};border-radius:4px}`}</style>
     {toast&&<div style={{position:"fixed",top:18,right:18,zIndex:9999,padding:"12px 20px",borderRadius:10,fontWeight:600,fontSize:13,animation:"fadeIn 0.2s",boxShadow:C.shadowL,background:toastBg,color:"#fff"}}>{toast.type==="success"?"✓ ":toast.type==="error"?"✕ ":"⚠ "}{toast.msg}</div>}
+    {saving>0&&<div role="status" style={{position:"fixed",bottom:16,left:16,zIndex:9999,padding:"6px 14px",borderRadius:99,fontSize:12,fontWeight:600,background:C.surface,color:C.muted,border:`1px solid ${C.border}`,boxShadow:C.shadowM}}>Saving…</div>}
     {!user&&<LoginPage onLogin={login} onRegister={register} db={db} ready={!!db} connError={!db&&loadFailed} C={C} dark={dark} setDark={setDark}/>}
     {user?.role==="superadmin"&&<SuperAdmin db={db} saveDb={saveDb} onLogout={logout} notify={notify} user={user} C={C} dark={dark} setDark={setDark}/>}
     {(user?.role==="admin"||user?.role==="staff"||user?.role==="accountant")&&myInst&&<InstDash db={db} saveDb={saveDb} onLogout={logout} notify={notify} user={user} inst={myInst} C={C} dark={dark} setDark={setDark}/>}
@@ -1033,6 +1224,7 @@ function SAInst({db,onAdd,onUpdate,onDelete,C}){
   </div>;
 }
 function SAUsers({db,onAdd,onDelete,onUpdate,C}){
+  const [editUser,setEditUser]=useState(null);
   const [showAdd,setShowAdd]=useState(false);const blank={name:"",username:"",password:"",email:"",role:"admin",instId:""};const [form,setForm]=useState(blank);
   function submit(){if(!form.name||!form.username||!form.password)return;onAdd(form);setForm(blank);setShowAdd(false);}
   const TH={padding:"10px 16px",textAlign:"left",fontSize:10,fontWeight:600,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",borderBottom:`1px solid ${C.border}`,background:C.bg||"#f2f4f6"};
@@ -1052,10 +1244,17 @@ function SAUsers({db,onAdd,onDelete,onUpdate,C}){
     <div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,overflow:"hidden",boxShadow:C.shadow}}>
       <table style={{width:"100%",borderCollapse:"collapse"}}>
         <thead><tr>{["User","Username","Role","Institution","Actions"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
-        <tbody>{db.users.filter(u=>u.role!=="superadmin").map(u=>{const inst=db.institutions.find(i=>i.id===u.instId);return<tr key={u.id} style={{borderBottom:`1px solid ${C.border}`}}><td style={{padding:"11px 16px"}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={u.name} color={u.role==="admin"?C.teal:C.green} size={30}/><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{u.name}</div><div style={{fontSize:10,color:C.muted}}>{u.email}</div></div></div></td><td style={{padding:"11px 16px",fontFamily:"monospace",fontSize:12,color:C.teal}}>{u.username}</td><td style={{padding:"11px 16px"}}><Badge label={u.role} color={u.role==="admin"?"teal":u.role==="accountant"?"gold":u.role==="staff"?"blue":"green"} C={C}/></td><td style={{padding:"11px 16px",fontSize:12,color:C.muted}}>{inst?.name?.slice(0,22)||"--"}</td><td style={{padding:"11px 16px"}}><div style={{display:"flex",gap:6}}><Btn onClick={()=>{const np=window.prompt("New password:",u.password);if(np)onUpdate(u.id,{password:np});}} C={C} color="gold" size="sm" outline>Reset Pwd</Btn><Btn onClick={()=>{if(confirmDelete(u.name))onDelete(u.id);}} C={C} color="red" size="sm" outline>Delete</Btn></div></td></tr>;})}
+        <tbody>{db.users.filter(u=>u.role!=="superadmin").map(u=>{const inst=db.institutions.find(i=>i.id===u.instId);return<tr key={u.id} style={{borderBottom:`1px solid ${C.border}`}}><td style={{padding:"11px 16px"}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={u.name} color={u.role==="admin"?C.teal:C.green} size={30}/><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{u.name}</div><div style={{fontSize:10,color:C.muted}}>{u.email}</div></div></div></td><td style={{padding:"11px 16px",fontFamily:"monospace",fontSize:12,color:C.teal}}>{u.username}</td><td style={{padding:"11px 16px"}}><Badge label={u.role} color={u.role==="admin"?"teal":u.role==="accountant"?"gold":u.role==="staff"?"blue":"green"} C={C}/></td><td style={{padding:"11px 16px",fontSize:12,color:C.muted}}>{inst?.name?.slice(0,22)||"--"}</td><td style={{padding:"11px 16px"}}><div style={{display:"flex",gap:6}}><Btn onClick={()=>setEditUser(u)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{const np=window.prompt("New password:",u.password);if(np)onUpdate(u.id,{password:np});}} C={C} color="gold" size="sm" outline>Reset Pwd</Btn><Btn onClick={()=>{if(confirmDelete(u.name))onDelete(u.id);}} C={C} color="red" size="sm" outline>Delete</Btn></div></td></tr>;})}
         {!db.users.filter(u=>u.role!=="superadmin").length&&<tr><td colSpan={5}><Empty msg="No users" C={C}/></td></tr>}</tbody>
       </table>
     </div>
+    {editUser&&<EditModal title={`Edit user — ${editUser.name}`} C={C} value={editUser} onClose={()=>setEditUser(null)} onSave={v=>{
+      if(db.users.some(x=>x.id!==v.id&&x.username===v.username.trim())){window.alert("That username is already taken");return;}
+      onUpdate(v.id,{name:v.name.trim(),username:v.username.trim(),email:v.email||"",role:v.role,instId:v.instId||null});setEditUser(null);}} fields={[
+      {k:"name",label:"Full Name *",required:true},{k:"username",label:"Username *",required:true},
+      {k:"email",label:"Email"},{k:"role",label:"Role",type:"select",options:[["admin","Admin"],["staff","Staff"],["accountant","Accountant"]]},
+      {k:"instId",label:"Institution",type:"select",span:true,options:[["","-- Select --"],...db.institutions.map(i=>[i.id,i.name])]},
+    ]}/>}
   </div>;
 }
 function SAStudents({db,C}){
@@ -1170,6 +1369,13 @@ function SABilling({db,saveDb,notify,C}){
     const others=billing.filter(b=>b.instId!==instId);
     saveDb({billing:[...others,{...r,status}]});notify("Status updated: "+status);
   }
+  const [editBill,setEditBill]=useState(null);
+  function saveBill(v){
+    const others=billing.filter(b=>b.instId!==v.instId);
+    const r=recFor(v.instId);if(!r)return;
+    saveDb({billing:[...others,{...r,price:Number(v.price)||0,nextDue:v.nextDue,status:v.status}]});
+    setEditBill(null);notify("Subscription saved");
+  }
   const active=billing.filter(b=>b.status==="Active");
   const mrr=active.reduce((a,b)=>a+Number(b.price||0),0);
   const overdue=billing.filter(b=>b.status==="Overdue").length;
@@ -1201,6 +1407,7 @@ function SABilling({db,saveDb,notify,C}){
           <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
             <Sel C={C} value={r?.plan||""} onChange={e=>setPlan(inst.id,e.target.value)} style={{width:"auto",padding:"6px 10px",fontSize:12}}><option value="" disabled>Set plan…</option>{PLANS.map(pl=><option key={pl.k} value={pl.k}>{pl.l}</option>)}</Sel>
             {r&&<Btn onClick={()=>markPaid(inst.id)} C={C} color="green" size="sm">Mark Paid</Btn>}
+            {r&&<Btn onClick={()=>setEditBill(r)} C={C} color="teal" size="sm" outline>Edit</Btn>}
             {r&&r.status!=="Suspended"&&<Btn onClick={()=>setStatus(inst.id,"Suspended")} C={C} color="red" size="sm" outline>Suspend</Btn>}
             {r&&r.status==="Suspended"&&<Btn onClick={()=>setStatus(inst.id,"Active")} C={C} color="green" size="sm" outline>Reactivate</Btn>}
           </div>
@@ -1212,6 +1419,10 @@ function SABilling({db,saveDb,notify,C}){
       </div>;})}
       {!db.institutions.length&&<Empty msg="No institutions to bill yet" C={C}/>}
     </div>
+    {editBill&&<EditModal title="Edit subscription" C={C} value={editBill} onClose={()=>setEditBill(null)} onSave={saveBill} fields={[
+      {k:"price",label:"Price per month (₹)",type:"number"},{k:"nextDue",label:"Next due date",type:"date"},
+      {k:"status",label:"Status",type:"select",span:true,options:["Active","Trial","Overdue","Suspended"]},
+    ]}/>}
   </div>;
 }
 
@@ -1783,6 +1994,12 @@ function InstUpdates({db,saveDb,user,inst,color,notify,C}){
     notify("📰 Update posted & students notified!");
   }
   function del(id){if(!confirmDelete("this update"))return;saveDb({dailyUpdates:(db.dailyUpdates||[]).filter(u=>u.id!==id),notifications:(db.notifications||[]).filter(n=>n.updateId!==id)});notify("Deleted","error");}
+  const [editing,setEditing]=useState(null);
+  function saveEdit(v){
+    saveDb({dailyUpdates:patchById(db.dailyUpdates,v.id,{type:v.type,title:v.title.trim(),dueDate:v.dueDate||"",meetingLink:(v.meetingLink||"").trim(),content:v.content||"",editedAt:new Date().toISOString()}),
+      notifications:(db.notifications||[]).map(n=>n.updateId===v.id?{...n,title:v.title.trim(),type:v.type}:n)});
+    setEditing(null);notify("Update saved");
+  }
 
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
@@ -1826,7 +2043,7 @@ function InstUpdates({db,saveDb,user,inst,color,notify,C}){
                 {upd.meetingLink&&<a href={upd.meetingLink} target="_blank" rel="noreferrer" style={{color:C.blue,fontWeight:600,fontSize:10}}>🔗 Meeting Link</a>}
               </div>
             </div>
-            <Btn onClick={()=>del(upd.id)} C={C} color="red" size="sm" outline>Del</Btn>
+            <div style={{display:"flex",gap:6,flexShrink:0}}><Btn onClick={()=>setEditing(upd)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>del(upd.id)} C={C} color="red" size="sm" outline>Del</Btn></div>
           </div>
           {/* Homework submissions */}
           {upd.type==="homework"&&subCount>0&&<div style={{marginTop:12,borderTop:`1px solid ${C.border}`,paddingTop:12}}>
@@ -1847,6 +2064,13 @@ function InstUpdates({db,saveDb,user,inst,color,notify,C}){
       })}
       {!updates.length&&<Empty msg="No updates posted yet — post one above" C={C}/>}
     </div>
+    {editing&&<EditModal title="Edit update" C={C} value={editing} onClose={()=>setEditing(null)} onSave={saveEdit} fields={[
+      {k:"type",label:"Type",type:"select",options:TYPES.map(t=>[t.k,`${t.i} ${t.l}`])},
+      {k:"title",label:"Title *",required:true},
+      {k:"dueDate",label:"Due Date",type:"date"},
+      {k:"meetingLink",label:"Meeting / Class Link",placeholder:"https://…"},
+      {k:"content",label:"Content / Details",type:"textarea"},
+    ]}/>}
   </div>;
 }
 
@@ -1909,6 +2133,13 @@ function StaffTasks({db,saveDb,user,inst,color,isAdmin,notify,C}){
     notify("Attachment added");
   }
 
+  const [editTask,setEditTask]=useState(null);
+  function saveTask(v){
+    if(!v.assignedTo){notify("Please assign to a staff member","error");return;}
+    const staff=instStaff.find(u=>u.id===v.assignedTo);
+    saveDb({staffTasks:patchById(db.staffTasks,v.id,{title:v.title.trim(),description:v.description||"",assignedTo:v.assignedTo,assignedToName:staff?.name||v.assignedToName||"",priority:v.priority,dueDate:v.dueDate||"",category:v.category||"",status:v.status,updatedAt:new Date().toISOString()})});
+    setEditTask(null);notify("Task saved");
+  }
   function deleteTask(id){
     if(!confirmDelete("this task"))return;
     saveDb({staffTasks:(db.staffTasks||[]).filter(t=>t.id!==id)});
@@ -2016,6 +2247,7 @@ function StaffTasks({db,saveDb,user,inst,color,isAdmin,notify,C}){
                 <Btn onClick={e=>{e.stopPropagation();updateStatus(task.id,task.status==="pending"?"in_progress":"done");}} C={C} color={task.status==="pending"?"blue":"green"} size="sm">
                   {task.status==="pending"?"Start":"Done"}
                 </Btn>}
+              {isAdmin&&<Btn onClick={e=>{e.stopPropagation();setEditTask(task);}} C={C} color="teal" size="sm" outline>Edit</Btn>}
               {isAdmin&&<Btn onClick={e=>{e.stopPropagation();deleteTask(task.id);}} C={C} color="red" size="sm" outline>Del</Btn>}
               <span style={{color:C.muted,fontSize:16,transform:expanded?"rotate(180deg)":"none",transition:"transform 0.2s"}}>⌄</span>
             </div>
@@ -2064,6 +2296,15 @@ function StaffTasks({db,saveDb,user,inst,color,isAdmin,notify,C}){
       })}
       {!myTasks.length&&<Empty msg={isAdmin?"No tasks yet — assign one above":"No tasks assigned to you yet"} C={C}/>}
     </div>
+    {editTask&&<EditModal title="Edit task" C={C} value={editTask} onClose={()=>setEditTask(null)} onSave={saveTask} fields={[
+      {k:"title",label:"Task Title *",required:true,span:true},
+      {k:"assignedTo",label:"Assign To *",type:"select",options:[["","-- Select Staff --"],...instStaff.map(u=>[u.id,`${u.name} (${u.designation||u.role})`])]},
+      {k:"priority",label:"Priority",type:"select",options:PRIORITIES.map(p=>[p.k,p.l])},
+      {k:"status",label:"Status",type:"select",options:STATUSES.map(x=>[x.k,x.l])},
+      {k:"dueDate",label:"Due Date",type:"date"},
+      {k:"category",label:"Category",span:true},
+      {k:"description",label:"Description",type:"textarea"},
+    ]}/>}
   </div>;
 }
 
@@ -2120,6 +2361,12 @@ function StaffAttend({db,saveDb,user,inst,color,isAdmin,notify,C}){
 
   // staff who belong to this institution
   const instStaff=(db.users||[]).filter(u=>u.instId===inst.id);
+  const [editAtt,setEditAtt]=useState(null);
+  function saveAtt(v){
+    if(v.outTime&&v.inTime&&v.outTime<v.inTime){notify("Out time can't be before In time","error");return;}
+    saveDb({staffAttendance:patchById(db.staffAttendance,v.id,{date:v.date,inTime:v.inTime||"",outTime:v.outTime||null,editedBy:user.name})});
+    setEditAtt(null);notify("Attendance corrected");
+  }
 
   // filtered records for admin view
   const filtered=myRecords.filter(r=>{
@@ -2189,7 +2436,7 @@ function StaffAttend({db,saveDb,user,inst,color,isAdmin,notify,C}){
       </div>
       <div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,overflow:"auto",boxShadow:C.shadow}}>
         <table style={{width:"100%",borderCollapse:"collapse",minWidth:600}}>
-          <thead><tr>{["Staff Name","Date","In Time","Out Time","Duration","Status"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+          <thead><tr>{["Staff Name","Date","In Time","Out Time","Duration","Status","Actions"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
           <tbody>
             {filtered.map(r=>{const mins=durMins(r.inTime,r.outTime);const status=r.outTime?"Complete":r.inTime?"In Progress":"--";const sc=r.outTime?C.green:r.inTime?C.gold:C.red;return<tr key={r.id}>
               <td style={TD}><div style={{fontWeight:600}}>{r.userName}</div></td>
@@ -2198,12 +2445,18 @@ function StaffAttend({db,saveDb,user,inst,color,isAdmin,notify,C}){
               <td style={{...TD,fontFamily:"monospace",color:C.blue,fontWeight:700}}>{r.outTime||"--"}</td>
               <td style={{...TD,color:C.purple,fontWeight:600}}>{fmtDur(mins)}</td>
               <td style={TD}><span style={{padding:"3px 10px",borderRadius:20,background:r.outTime?C.greenL:r.inTime?C.goldL:C.redL,color:sc,fontSize:10,fontWeight:700}}>{status}</span></td>
+              <td style={TD}><div style={{display:"flex",gap:6}}><Btn onClick={()=>setEditAtt(r)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{if(confirmDelete("this attendance record")){saveDb({staffAttendance:(db.staffAttendance||[]).filter(x=>x.id!==r.id)});notify("Record deleted","error");}}} C={C} color="red" size="sm" outline>Del</Btn></div></td>
             </tr>;})}
-            {!filtered.length&&<tr><td colSpan={6}><Empty msg="No records found" C={C}/></td></tr>}
+            {!filtered.length&&<tr><td colSpan={7}><Empty msg="No records found" C={C}/></td></tr>}
           </tbody>
         </table>
       </div>
     </div>}
+    {editAtt&&<EditModal title={`Edit attendance — ${editAtt.userName||""}`} C={C} value={{...editAtt,outTime:editAtt.outTime||""}} onClose={()=>setEditAtt(null)} onSave={saveAtt} fields={[
+      {k:"date",label:"Date",type:"date",required:true,span:true},
+      {k:"inTime",label:"In Time",type:"time"},
+      {k:"outTime",label:"Out Time",type:"time"},
+    ]}/>}
   </div>;
 }
 
@@ -2572,6 +2825,12 @@ function InstAccounts({db,saveDb,inst,color,isAdmin,notify,C}){
     notify(form.type==="income"?"💰 Income recorded":"💸 Expense recorded");
   }
   function delTx(id){saveDb({accounts:(db.accounts||[]).filter(t=>t.id!==id)});notify("Entry deleted","error");}
+  const [editTx,setEditTx]=useState(null);
+  function saveTx(v){
+    if(!(Number(v.amount)>0)||!v.category||!v.date){notify("Fill amount, category and date","error");return;}
+    saveDb({accounts:patchById(db.accounts,v.id,{date:v.date,type:v.type,category:v.category,description:v.description||"",amount:Number(v.amount),ref:v.ref||"",editedAt:new Date().toISOString()})});
+    setEditTx(null);notify("Entry saved");
+  }
 
   // Group by date for daily view
   const byDate={};
@@ -2688,7 +2947,7 @@ function InstAccounts({db,saveDb,inst,color,isAdmin,notify,C}){
             <td style={TD}><span style={{color:C.muted}}>{t.description||"--"}</span></td>
             <td style={{...TD,fontFamily:"monospace",fontSize:11}}>{t.ref||"--"}</td>
             <td style={{...TD,fontWeight:800,color:subTab==="income"?C.green:C.red}}>₹{Number(t.amount).toLocaleString()}</td>
-            <td style={TD}><Btn onClick={()=>{if(confirmDelete("this entry"))delTx(t.id);}} C={C} color="red" size="sm" outline>Del</Btn></td>
+            <td style={TD}><div style={{display:"flex",gap:6}}><Btn onClick={()=>setEditTx(t)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{if(confirmDelete("this entry"))delTx(t.id);}} C={C} color="red" size="sm" outline>Del</Btn></div></td>
           </tr>)}
           {!monthTx.filter(t=>t.type===subTab).length&&<tr><td colSpan={6}><Empty msg={`No ${subTab} records for ${filterMonth}`} C={C}/></td></tr>}
         </tbody>
@@ -2714,7 +2973,7 @@ function InstAccounts({db,saveDb,inst,color,isAdmin,notify,C}){
             <td style={{...TD,color:C.muted}}>{t.description||"--"}</td>
             <td style={{...TD,fontFamily:"monospace",fontSize:11,color:C.muted}}>{t.ref||""}</td>
             <td style={{...TD,fontWeight:700,color:t.type==="income"?C.green:C.red,textAlign:"right"}}>₹{Number(t.amount).toLocaleString()}</td>
-            <td style={{...TD,width:60}}><Btn onClick={()=>{if(confirmDelete("this entry"))delTx(t.id);}} C={C} color="red" size="sm" outline>Del</Btn></td>
+            <td style={{...TD,width:120}}><div style={{display:"flex",gap:6}}><Btn onClick={()=>setEditTx(t)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{if(confirmDelete("this entry"))delTx(t.id);}} C={C} color="red" size="sm" outline>Del</Btn></div></td>
           </tr>)}</tbody>
         </table>
       </div>;})}
@@ -2766,6 +3025,14 @@ function InstAccounts({db,saveDb,inst,color,isAdmin,notify,C}){
         </table>
       </div>
     </div>}
+    {editTx&&<EditModal title="Edit entry" C={C} value={editTx} onClose={()=>setEditTx(null)} onSave={saveTx} fields={[
+      {k:"type",label:"Type",type:"select",options:[["income","Income"],["expense","Expense"]]},
+      {k:"date",label:"Date *",type:"date",required:true},
+      {k:"category",label:"Category *",type:"select",required:true,options:[["","-- Select --"],...Array.from(new Set([...(editTx.type==="expense"?EXPENSE_CATS:INCOME_CATS),...INCOME_CATS,...EXPENSE_CATS,editTx.category].filter(Boolean)))]},
+      {k:"amount",label:"Amount *",type:"number",required:true},
+      {k:"ref",label:"Reference"},
+      {k:"description",label:"Description"},
+    ]} danger={editTx.source==="fee"?"This entry was created from a fee payment. Editing it here doesn't change the student's fee record.":null}/>}
   </div>;
 }
 
@@ -3027,7 +3294,7 @@ function InstDash({db,saveDb,onLogout,notify,user,inst,C,dark,setDark}){
         {tab==="homework"&&<InstHomework students={myStudents} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
         {tab==="exams"&&<InstExams students={myStudents} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
         {tab==="assign"&&<InstAssign students={myStudents} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
-        {tab==="timetable"&&<InstTimetable inst={inst} color={color} notify={notify} C={C}/>}
+        {tab==="timetable"&&<InstTimetable db={db} saveDb={saveDb} inst={inst} color={color} notify={notify} C={C}/>}
         {tab==="idcard"&&<InstIDCards students={myStudents} inst={inst} color={color} C={C}/>}
         {tab==="receipt"&&<InstReceipts students={myStudents} inst={inst} color={color} C={C}/>}
         {tab==="notifs"&&<StuNotifications notifs={myNotifs} unread={unreadNotifs} onClear={clearNotif} onClearAll={clearAllNotifs} onMarkRead={markAllNotifsRead} user={user} C={C}/>}
@@ -3047,7 +3314,7 @@ function InstDash({db,saveDb,onLogout,notify,user,inst,C,dark,setDark}){
         {tab==="analytics"&&<InstAnalytics students={myStudents} inst={inst} color={color} db={db} C={C}/>}
         {tab==="ai"&&<InstAIHub students={myStudents} inst={inst} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
         {tab==="certificates"&&<InstCertificates students={myStudents} inst={inst} color={color} C={C}/>}
-        {tab==="onlineexam"&&<InstOnlineExams students={myStudents} inst={inst} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
+        {tab==="onlineexam"&&<InstOnlineExams db={db} saveDb={saveDb} students={myStudents} inst={inst} color={color} onUpdate={updStudent} notify={notify} C={C}/>}
         {tab==="library"&&<InstLibrary db={db} saveDb={saveDb} inst={inst} color={color} isAdmin={isAdmin} notify={notify} C={C}/>}
         {tab==="payroll"&&isAdmin&&<InstPayroll db={db} saveDb={saveDb} inst={inst} color={color} notify={notify} C={C}/>}
         {tab==="leave"&&<InstLeave db={db} saveDb={saveDb} user={user} inst={inst} color={color} isAdmin={isAdmin} notify={notify} C={C}/>}
@@ -3784,6 +4051,18 @@ function InstFees({students,db,saveDb,inst,color,onUpdate,notify,C}){
     setPayFor(null);setPayForm({amount:"",mode:"Cash",date:today()});
     notify("Payment recorded!");
   }
+  const [editFee,setEditFee]=useState(null);
+  function saveFee(v){
+    if(!(Number(v.amount)>0)){notify("Enter the total amount","error");return;}
+    const paid=Number(v.paid||0);
+    writeFees((s.fees||[]).map(f=>f.id===v.id?{...f,month:v.month,amount:Number(v.amount),paid,mode:v.mode,date:v.date,status:v.waived==="yes"?"Waived":undefined}:f),null);
+    setEditFee(null);notify("Fee record saved");
+  }
+  function delFee(feeId){
+    if(!confirmDelete("this fee record"))return;
+    writeFees((s.fees||[]).filter(f=>f.id!==feeId),null);
+    notify("Fee record deleted","error");
+  }
   const tc2=students.flatMap(s=>s.fees||[]).reduce((a,f)=>a+Number(f.paid||0),0);
   const td=students.flatMap(s=>s.fees||[]).reduce((a,f)=>a+Math.max(0,Number(f.amount||0)-Number(f.paid||0)),0);
   const pendingStudents=students.filter(st=>(st.fees||[]).some(f=>f.status!=="Waived"&&(Number(f.amount||0)-Number(f.paid||0))>0));
@@ -3830,6 +4109,8 @@ function InstFees({students,db,saveDb,inst,color,onUpdate,notify,C}){
             <div style={{display:"flex",gap:8,marginTop:8,justifyContent:"flex-end"}}>
               {stt!=="Waived"&&bal>0&&<Btn onClick={()=>{setPayFor(payFor===fee.id?null:fee.id);setPayForm({amount:"",mode:fee.mode||"Cash",date:today()});}} C={C} color="green" size="sm">+ Pay</Btn>}
               <button onClick={()=>writeFees((s.fees||[]).map(f=>f.id===fee.id?{...f,status:stt==="Waived"?undefined:"Waived"}:f),null)} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:7,padding:"3px 10px",fontSize:11,color:C.muted,cursor:"pointer"}}>{stt==="Waived"?"Unwaive":"Waive"}</button>
+              <Btn onClick={()=>setEditFee({...fee,waived:fee.status==="Waived"?"yes":"no"})} C={C} color="teal" size="sm" outline>Edit</Btn>
+              <Btn onClick={()=>delFee(fee.id)} C={C} color="red" size="sm" outline>Del</Btn>
             </div>
             {payFor===fee.id&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr auto",gap:8,marginTop:10,alignItems:"end",background:C.surface,padding:10,borderRadius:8,border:`1px solid ${C.border}`}}>
               <FG label="Amount (Rs.)" C={C}><Inp C={C} type="number" value={payForm.amount} onChange={e=>setPayForm(f=>({...f,amount:e.target.value}))} placeholder="0"/></FG>
@@ -3840,6 +4121,14 @@ function InstFees({students,db,saveDb,inst,color,onUpdate,notify,C}){
           </div>);})}
       </div>:<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"50px",textAlign:"center",color:C.muted,boxShadow:C.shadow}}>Select a student to manage fees</div>}</div>
     </div>
+    {editFee&&<EditModal title={`Edit fee — ${editFee.month||""}`} C={C} value={editFee} onClose={()=>setEditFee(null)} onSave={saveFee} fields={[
+      {k:"month",label:"Month",required:true,span:true},
+      {k:"amount",label:"Total (Rs.) *",type:"number",required:true},
+      {k:"paid",label:"Paid so far (Rs.)",type:"number"},
+      {k:"mode",label:"Mode",placeholder:"Cash/UPI"},
+      {k:"date",label:"Date",type:"date"},
+      {k:"waived",label:"Waived?",type:"select",options:[["no","No"],["yes","Yes — fee waived"]]},
+    ]} danger="Changing 'Paid so far' corrects the record only. Use '+ Pay' to record a new payment so it also appears in Accounts."/>}
   </div>;
 }
 
@@ -3849,6 +4138,9 @@ function InstHomework({students,color,onUpdate,notify,C}){
   const s=students.find(x=>x.id===sel);
   function add(){if(!form.title){notify("Title required","error");return;}onUpdate(sel,{homeworks:[...(s.homeworks||[]),{...form,id:uid(),assignedDate:today()}]});notify("Assigned!");setShowAdd(false);setForm({title:"",subject:"",dueDate:"",description:"",status:"Pending"});}
   function upd(hid,status){onUpdate(sel,{homeworks:(s.homeworks||[]).map(h=>h.id===hid?{...h,status}:h)});}
+  const [editHw,setEditHw]=useState(null);
+  function saveHw(v){onUpdate(sel,{homeworks:patchById(s.homeworks,v.id,{title:v.title.trim(),subject:v.subject||"",dueDate:v.dueDate||"",status:v.status,description:v.description||""})});setEditHw(null);notify("Homework saved");}
+  function delHw(hid){if(!confirmDelete("this homework"))return;onUpdate(sel,{homeworks:(s.homeworks||[]).filter(h=>h.id!==hid)});notify("Deleted","error");}
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="📚 Homework" sub="Assign and track homework" C={C}/>
     <div style={{display:"grid",gridTemplateColumns:"220px 1fr",gap:16,alignItems:"start"}}>
@@ -3857,9 +4149,14 @@ function InstHomework({students,color,onUpdate,notify,C}){
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={s.name} photo={s.photo} color={color} size={34}/><div style={{fontWeight:700,fontSize:13,color:C.text}}>{s.name}</div></div><Btn onClick={()=>setShowAdd(x=>!x)} C={C} color="gold">+ Assign</Btn></div>
         {showAdd&&<div style={{background:C.bg,borderRadius:10,padding:14,marginBottom:14,border:`1px solid ${C.border}`}}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}><FG label="Title *" C={C}><Inp C={C} value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))} placeholder="Homework title"/></FG><FG label="Subject" C={C}><Inp C={C} value={form.subject} onChange={e=>setForm(f=>({...f,subject:e.target.value}))} placeholder="Subject"/></FG><FG label="Due Date" C={C}><Inp C={C} type="date" value={form.dueDate} onChange={e=>setForm(f=>({...f,dueDate:e.target.value}))}/></FG><FG label="Status" C={C}><Sel C={C} value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value}))}>{HW_STATUS.map(x=><option key={x}>{x}</option>)}</Sel></FG><FG label="Description" span C={C}><Txt C={C} value={form.description} onChange={e=>setForm(f=>({...f,description:e.target.value}))} rows={2} placeholder="Details..."/></FG></div><Btn onClick={add} C={C} color="gold">Assign</Btn></div>}
         {!(s.homeworks||[]).length&&<Empty msg="No homework yet" C={C}/>}
-        {(s.homeworks||[]).slice().reverse().map(hw=><div key={hw.id} style={{background:C.bg,borderRadius:9,padding:"11px 14px",marginBottom:6,border:`1px solid ${C.border}`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{hw.title}</div><div style={{fontSize:10,color:C.muted}}>{hw.subject} · Due: {fmt(hw.dueDate)}</div>{hw.description&&<div style={{fontSize:10,color:C.muted,marginTop:2}}>{hw.description}</div>}</div><div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0,marginLeft:8}}><Badge label={hw.status} color={hw.status==="Submitted"?"green":hw.status==="Late"?"red":hw.status==="Incomplete"?"gold":"teal"} C={C}/><Sel C={C} value={hw.status} onChange={e=>upd(hw.id,e.target.value)} style={{width:"auto",padding:"3px 8px",fontSize:11}}>{HW_STATUS.map(x=><option key={x}>{x}</option>)}</Sel></div></div></div>)}
+        {(s.homeworks||[]).slice().reverse().map(hw=><div key={hw.id} style={{background:C.bg,borderRadius:9,padding:"11px 14px",marginBottom:6,border:`1px solid ${C.border}`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{hw.title}</div><div style={{fontSize:10,color:C.muted}}>{hw.subject} · Due: {fmt(hw.dueDate)}</div>{hw.description&&<div style={{fontSize:10,color:C.muted,marginTop:2}}>{hw.description}</div>}</div><div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0,marginLeft:8}}><Badge label={hw.status} color={hw.status==="Submitted"?"green":hw.status==="Late"?"red":hw.status==="Incomplete"?"gold":"teal"} C={C}/><Sel C={C} value={hw.status} onChange={e=>upd(hw.id,e.target.value)} style={{width:"auto",padding:"3px 8px",fontSize:11}}>{HW_STATUS.map(x=><option key={x}>{x}</option>)}</Sel><Btn onClick={()=>setEditHw(hw)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>delHw(hw.id)} C={C} color="red" size="sm" outline>Del</Btn></div></div></div>)}
       </div>:<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"50px",textAlign:"center",color:C.muted,boxShadow:C.shadow}}>Select a student</div>}</div>
     </div>
+    {editHw&&<EditModal title="Edit homework" C={C} value={editHw} onClose={()=>setEditHw(null)} onSave={saveHw} fields={[
+      {k:"title",label:"Title *",required:true},{k:"subject",label:"Subject"},
+      {k:"dueDate",label:"Due Date",type:"date"},{k:"status",label:"Status",type:"select",options:HW_STATUS},
+      {k:"description",label:"Description",type:"textarea"},
+    ]}/>}
   </div>;
 }
 
@@ -3868,6 +4165,15 @@ function InstExams({students,color,onUpdate,notify,C}){
   const [form,setForm]=useState({examName:"",subject:"",date:"",marks:"",maxMarks:"100",grade:"",remarks:""});
   const s=students.find(x=>x.id===sel);
   function add(){if(!form.examName||!form.marks){notify("Fill exam name and marks","error");return;}const pct=Math.round((Number(form.marks)/Number(form.maxMarks))*100);const ag=pct>=90?"A+":pct>=80?"A":pct>=70?"B+":pct>=60?"B":pct>=50?"C":"F";onUpdate(sel,{exams:[...(s.exams||[]),{...form,id:uid(),percentage:pct,grade:form.grade||ag}]});notify("Marks recorded!");setShowAdd(false);setForm({examName:"",subject:"",date:"",marks:"",maxMarks:"100",grade:"",remarks:""});}
+  const [editEx,setEditEx]=useState(null);
+  function saveEx(v){
+    const mx=Number(v.maxMarks)||100, mk=Number(v.marks);
+    if(v.marks===""||isNaN(mk)){notify("Enter the marks","error");return;}
+    const pct=Math.round((mk/mx)*100);const ag=pct>=90?"A+":pct>=80?"A":pct>=70?"B+":pct>=60?"B":pct>=50?"C":"F";
+    onUpdate(sel,{exams:patchById(s.exams,v.id,{examName:v.examName.trim(),subject:v.subject||"",date:v.date||"",marks:String(v.marks),maxMarks:String(mx),percentage:pct,grade:(v.grade||"").trim()||ag,remarks:v.remarks||""})});
+    setEditEx(null);notify("Marks saved");
+  }
+  function delEx(eid){if(!confirmDelete("this exam record"))return;onUpdate(sel,{exams:(s.exams||[]).filter(e=>e.id!==eid)});notify("Deleted","error");}
   const avg=s&&(s.exams||[]).length?Math.round((s.exams||[]).reduce((a,e)=>a+Number(e.percentage||0),0)/(s.exams||[]).length):null;
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="📝 Exam Marks" sub="Record and track results" C={C}/>
@@ -3877,9 +4183,15 @@ function InstExams({students,color,onUpdate,notify,C}){
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={s.name} photo={s.photo} color={color} size={34}/><div><div style={{fontWeight:700,fontSize:13,color:C.text}}>{s.name}</div>{avg!=null&&<div style={{fontSize:11,color:C.teal}}>Avg: {avg}%</div>}</div></div><Btn onClick={()=>setShowAdd(x=>!x)} C={C} color="blue">+ Add Marks</Btn></div>
         {showAdd&&<div style={{background:C.bg,borderRadius:10,padding:14,marginBottom:14,border:`1px solid ${C.border}`}}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:10}}><FG label="Exam Name *" C={C}><Inp C={C} value={form.examName} onChange={e=>setForm(f=>({...f,examName:e.target.value}))} placeholder="Unit Test 1"/></FG><FG label="Subject" C={C}><Inp C={C} value={form.subject} onChange={e=>setForm(f=>({...f,subject:e.target.value}))} placeholder="Maths"/></FG><FG label="Date" C={C}><Inp C={C} type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))}/></FG><FG label="Marks *" C={C}><Inp C={C} type="number" value={form.marks} onChange={e=>setForm(f=>({...f,marks:e.target.value}))} placeholder="85"/></FG><FG label="Max Marks" C={C}><Inp C={C} type="number" value={form.maxMarks} onChange={e=>setForm(f=>({...f,maxMarks:e.target.value}))}/></FG><FG label="Grade (auto)" C={C}><Inp C={C} value={form.grade} onChange={e=>setForm(f=>({...f,grade:e.target.value}))} placeholder="A/B..."/></FG><FG label="Remarks" span C={C}><Inp C={C} value={form.remarks} onChange={e=>setForm(f=>({...f,remarks:e.target.value}))} placeholder="Feedback"/></FG></div><Btn onClick={add} C={C} color="blue">Save</Btn></div>}
         {!(s.exams||[]).length&&<Empty msg="No exam records yet" C={C}/>}
-        {(s.exams||[]).slice().reverse().map(ex=>{const pct=Number(ex.percentage||0);const bc=pct>=75?C.green:pct>=50?C.gold:C.red;return<div key={ex.id} style={{background:C.bg,borderRadius:9,padding:"11px 14px",marginBottom:6,border:`1px solid ${C.border}`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{ex.examName} {ex.subject&&<span style={{color:C.muted,fontWeight:400}}>· {ex.subject}</span>}</div><div style={{fontSize:10,color:C.muted}}>{fmt(ex.date)}{ex.remarks&&` · ${ex.remarks}`}</div></div><div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:18,color:bc}}>{ex.marks}<span style={{fontSize:11,color:C.muted,fontWeight:400}}>/{ex.maxMarks}</span></div><Badge label={ex.grade} color={pct>=75?"green":pct>=50?"gold":"red"} C={C}/></div></div><div style={{height:6,background:C.border,borderRadius:99}}><div style={{height:"100%",width:`${pct}%`,background:bc,borderRadius:99}}/></div><div style={{fontSize:10,color:C.muted,marginTop:4}}>{pct}%</div></div>;})}
+        {(s.exams||[]).slice().reverse().map(ex=>{const pct=Number(ex.percentage||0);const bc=pct>=75?C.green:pct>=50?C.gold:C.red;return<div key={ex.id} style={{background:C.bg,borderRadius:9,padding:"11px 14px",marginBottom:6,border:`1px solid ${C.border}`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{ex.examName} {ex.subject&&<span style={{color:C.muted,fontWeight:400}}>· {ex.subject}</span>}</div><div style={{fontSize:10,color:C.muted}}>{fmt(ex.date)}{ex.remarks&&` · ${ex.remarks}`}</div></div><div style={{textAlign:"right"}}><div style={{fontWeight:800,fontSize:18,color:bc}}>{ex.marks}<span style={{fontSize:11,color:C.muted,fontWeight:400}}>/{ex.maxMarks}</span></div><Badge label={ex.grade} color={pct>=75?"green":pct>=50?"gold":"red"} C={C}/></div></div><div style={{height:6,background:C.border,borderRadius:99}}><div style={{height:"100%",width:`${pct}%`,background:bc,borderRadius:99}}/></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:4}}><div style={{fontSize:10,color:C.muted}}>{pct}%</div><div style={{display:"flex",gap:6}}><Btn onClick={()=>setEditEx({...ex,grade:""})} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>delEx(ex.id)} C={C} color="red" size="sm" outline>Del</Btn></div></div></div>;})}
       </div>:<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"50px",textAlign:"center",color:C.muted,boxShadow:C.shadow}}>Select a student</div>}</div>
     </div>
+    {editEx&&<EditModal title="Edit exam marks" C={C} value={editEx} onClose={()=>setEditEx(null)} onSave={saveEx} fields={[
+      {k:"examName",label:"Exam Name *",required:true},{k:"subject",label:"Subject"},
+      {k:"date",label:"Date",type:"date"},{k:"marks",label:"Marks *",type:"number",required:true},
+      {k:"maxMarks",label:"Max Marks",type:"number"},{k:"grade",label:"Grade (leave blank to auto-calculate)"},
+      {k:"remarks",label:"Remarks",span:true},
+    ]}/>}
   </div>;
 }
 
@@ -3889,6 +4201,9 @@ function InstAssign({students,color,onUpdate,notify,C}){
   const s=students.find(x=>x.id===sel);
   function add(){if(!form.title){notify("Title required","error");return;}onUpdate(sel,{assignments:[...(s.assignments||[]),{...form,id:uid()}]});notify("Added!");setShowAdd(false);setForm({title:"",subject:"",assignedDate:today(),dueDate:"",maxMarks:"",marksObtained:"",status:"Assigned",type:"Written",remarks:""});}
   function upd(aid,status){onUpdate(sel,{assignments:(s.assignments||[]).map(a=>a.id===aid?{...a,status}:a)});}
+  const [editAs,setEditAs]=useState(null);
+  function saveAs(v){onUpdate(sel,{assignments:patchById(s.assignments,v.id,{title:v.title.trim(),subject:v.subject||"",type:v.type,assignedDate:v.assignedDate||"",dueDate:v.dueDate||"",maxMarks:v.maxMarks||"",marksObtained:v.marksObtained||"",status:v.status,remarks:v.remarks||""})});setEditAs(null);notify("Assignment saved");}
+  function delAs(aid){if(!confirmDelete("this assignment"))return;onUpdate(sel,{assignments:(s.assignments||[]).filter(a=>a.id!==aid)});notify("Deleted","error");}
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="📋 Assignments" sub="Manage and grade assignments" C={C}/>
     <div style={{display:"grid",gridTemplateColumns:"220px 1fr",gap:16,alignItems:"start"}}>
@@ -3897,16 +4212,24 @@ function InstAssign({students,color,onUpdate,notify,C}){
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={s.name} photo={s.photo} color={color} size={34}/><div style={{fontWeight:700,fontSize:13,color:C.text}}>{s.name}</div></div><Btn onClick={()=>setShowAdd(x=>!x)} C={C} color="purple">+ Add</Btn></div>
         {showAdd&&<div style={{background:C.bg,borderRadius:10,padding:14,marginBottom:14,border:`1px solid ${C.border}`}}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:10}}><FG label="Title *" C={C}><Inp C={C} value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))} placeholder="Assignment title"/></FG><FG label="Subject" C={C}><Inp C={C} value={form.subject} onChange={e=>setForm(f=>({...f,subject:e.target.value}))} placeholder="Subject"/></FG><FG label="Type" C={C}><Sel C={C} value={form.type} onChange={e=>setForm(f=>({...f,type:e.target.value}))}>{ASSIGN_TYPES.map(t=><option key={t}>{t}</option>)}</Sel></FG><FG label="Due Date" C={C}><Inp C={C} type="date" value={form.dueDate} onChange={e=>setForm(f=>({...f,dueDate:e.target.value}))}/></FG><FG label="Max Marks" C={C}><Inp C={C} type="number" value={form.maxMarks} onChange={e=>setForm(f=>({...f,maxMarks:e.target.value}))} placeholder="20"/></FG><FG label="Status" C={C}><Sel C={C} value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value}))}>{ASSIGN_STATUS.map(x=><option key={x}>{x}</option>)}</Sel></FG><FG label="Marks Obtained" C={C}><Inp C={C} type="number" value={form.marksObtained} onChange={e=>setForm(f=>({...f,marksObtained:e.target.value}))} placeholder="After grading"/></FG><FG label="Remarks" C={C}><Inp C={C} value={form.remarks} onChange={e=>setForm(f=>({...f,remarks:e.target.value}))} placeholder="Feedback"/></FG></div><Btn onClick={add} C={C} color="purple">Save</Btn></div>}
         {!(s.assignments||[]).length&&<Empty msg="No assignments yet" C={C}/>}
-        {(s.assignments||[]).slice().reverse().map(a=>{const sc=a.status==="Graded"||a.status==="Submitted"?"green":a.status==="Late"||a.status==="Not Submitted"?"red":"gold";const scC=tc(C,sc);const scL=tb(C,sc);return<div key={a.id} style={{background:C.bg,borderRadius:9,padding:"11px 14px",marginBottom:6,border:`1px solid ${C.border}`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:5}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{a.title}</div><div style={{fontSize:10,color:C.muted}}>{a.subject} · {a.type} · Due: {fmt(a.dueDate)}</div>{a.remarks&&<div style={{fontSize:10,color:C.muted,marginTop:1}}>💬 {a.remarks}</div>}</div><div style={{textAlign:"right",flexShrink:0,marginLeft:8}}>{a.marksObtained&&a.maxMarks&&<div style={{fontWeight:700,color:C.teal,fontSize:12}}>{a.marksObtained}/{a.maxMarks}</div>}<Badge label={a.status} color={sc} C={C}/></div></div><div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{["Submitted","Graded","Late","Not Submitted"].map(st=><button key={st} onClick={()=>upd(a.id,st)} style={{padding:"3px 9px",border:`1px solid ${a.status===st?scC:C.border}`,borderRadius:5,background:a.status===st?scL:"transparent",color:a.status===st?scC:C.muted,fontSize:10,fontWeight:600,cursor:"pointer"}}>{st}</button>)}</div></div>;})}
+        {(s.assignments||[]).slice().reverse().map(a=>{const sc=a.status==="Graded"||a.status==="Submitted"?"green":a.status==="Late"||a.status==="Not Submitted"?"red":"gold";const scC=tc(C,sc);const scL=tb(C,sc);return<div key={a.id} style={{background:C.bg,borderRadius:9,padding:"11px 14px",marginBottom:6,border:`1px solid ${C.border}`}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:5}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{a.title}</div><div style={{fontSize:10,color:C.muted}}>{a.subject} · {a.type} · Due: {fmt(a.dueDate)}</div>{a.remarks&&<div style={{fontSize:10,color:C.muted,marginTop:1}}>💬 {a.remarks}</div>}</div><div style={{textAlign:"right",flexShrink:0,marginLeft:8}}>{a.marksObtained&&a.maxMarks&&<div style={{fontWeight:700,color:C.teal,fontSize:12}}>{a.marksObtained}/{a.maxMarks}</div>}<Badge label={a.status} color={sc} C={C}/></div></div><div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{["Submitted","Graded","Late","Not Submitted"].map(st=><button key={st} onClick={()=>upd(a.id,st)} style={{padding:"3px 9px",border:`1px solid ${a.status===st?scC:C.border}`,borderRadius:5,background:a.status===st?scL:"transparent",color:a.status===st?scC:C.muted,fontSize:10,fontWeight:600,cursor:"pointer"}}>{st}</button>)}<span style={{flex:1}}/><Btn onClick={()=>setEditAs(a)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>delAs(a.id)} C={C} color="red" size="sm" outline>Del</Btn></div></div>;})}
       </div>:<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"50px",textAlign:"center",color:C.muted,boxShadow:C.shadow}}>Select a student</div>}</div>
     </div>
+    {editAs&&<EditModal title="Edit assignment" C={C} value={editAs} onClose={()=>setEditAs(null)} onSave={saveAs} fields={[
+      {k:"title",label:"Title *",required:true},{k:"subject",label:"Subject"},
+      {k:"type",label:"Type",type:"select",options:ASSIGN_TYPES},{k:"status",label:"Status",type:"select",options:ASSIGN_STATUS},
+      {k:"assignedDate",label:"Assigned Date",type:"date"},{k:"dueDate",label:"Due Date",type:"date"},
+      {k:"maxMarks",label:"Max Marks",type:"number"},{k:"marksObtained",label:"Marks Obtained",type:"number"},
+      {k:"remarks",label:"Remarks",span:true},
+    ]}/>}
   </div>;
 }
 
-function InstTimetable({inst,color,notify,C}){
+function InstTimetable({db,saveDb,inst,color,notify,C}){
   const KEY=`allbee_tt5_${inst.id}`;
-  const [classes,setClasses]=useState(()=>lsGet(KEY,[]));const [selCls,setSelCls]=useState(null);const [showAdd,setShowAdd]=useState(false);const [newCls,setNewCls]=useState({name:"",section:"",teacher:""});const [editing,setEditing]=useState(null);const [cellForm,setCellForm]=useState({subject:"",teacher:"",room:""});
-  function saveCls(c){setClasses(c);lsSet(KEY,c);}
+  const [classes,setClassList]=useInstList(db,saveDb,"timetables",inst.id,KEY);
+  const [editCls,setEditCls]=useState(null);const [selCls,setSelCls]=useState(null);const [showAdd,setShowAdd]=useState(false);const [newCls,setNewCls]=useState({name:"",section:"",teacher:""});const [editing,setEditing]=useState(null);const [cellForm,setCellForm]=useState({subject:"",teacher:"",room:""});
+  function saveCls(c){setClassList(c);}
   function addClass(){if(!newCls.name.trim()){notify("Class name required","error");return;}const c=[...classes,{id:uid(),...newCls,timetable:{}}];saveCls(c);setSelCls(c[c.length-1].id);setNewCls({name:"",section:"",teacher:""});setShowAdd(false);notify("Class created!");}
   function delClass(id){if(!confirmDelete("this class"))return;saveCls(classes.filter(c=>c.id!==id));if(selCls===id)setSelCls(null);}
   const cls=classes.find(c=>c.id===selCls);
@@ -3922,7 +4245,7 @@ function InstTimetable({inst,color,notify,C}){
       <div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,overflow:"hidden",boxShadow:C.shadow}}>
         <div style={{padding:"10px 14px",borderBottom:`1px solid ${C.border}`,fontSize:10,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em"}}>Classes</div>
         {!classes.length&&<Empty msg="No classes yet" C={C}/>}
-        {classes.map(c=><div key={c.id} onClick={()=>setSelCls(c.id)} style={{padding:"11px 14px",borderBottom:`1px solid ${C.border}`,cursor:"pointer",background:selCls===c.id?C.tealL:"transparent",transition:"background 0.1s"}} onMouseOver={e=>{if(selCls!==c.id)e.currentTarget.style.background=C.bg;}} onMouseOut={e=>{if(selCls!==c.id)e.currentTarget.style.background="transparent";}}><div style={{fontWeight:600,fontSize:12,color:selCls===c.id?C.teal:C.text}}>{c.name} {c.section&&`- ${c.section}`}</div>{c.teacher&&<div style={{fontSize:10,color:C.muted}}>{c.teacher}</div>}<div style={{fontSize:9,color:C.muted,marginTop:2}}>{Object.keys(c.timetable||{}).length} slots filled</div><button onClick={e=>{e.stopPropagation();delClass(c.id);}} style={{fontSize:9,color:C.red,background:"none",border:"none",padding:0,marginTop:3,cursor:"pointer"}}>Delete</button></div>)}
+        {classes.map(c=><div key={c.id} onClick={()=>setSelCls(c.id)} style={{padding:"11px 14px",borderBottom:`1px solid ${C.border}`,cursor:"pointer",background:selCls===c.id?C.tealL:"transparent",transition:"background 0.1s"}} onMouseOver={e=>{if(selCls!==c.id)e.currentTarget.style.background=C.bg;}} onMouseOut={e=>{if(selCls!==c.id)e.currentTarget.style.background="transparent";}}><div style={{fontWeight:600,fontSize:12,color:selCls===c.id?C.teal:C.text}}>{c.name} {c.section&&`- ${c.section}`}</div>{c.teacher&&<div style={{fontSize:10,color:C.muted}}>{c.teacher}</div>}<div style={{fontSize:9,color:C.muted,marginTop:2}}>{Object.keys(c.timetable||{}).length} slots filled</div><div style={{display:"flex",gap:10}}><button onClick={e=>{e.stopPropagation();setEditCls(c);}} style={{fontSize:9,color:C.teal,background:"none",border:"none",padding:0,marginTop:3,cursor:"pointer",fontWeight:600}}>Edit</button><button onClick={e=>{e.stopPropagation();delClass(c.id);}} style={{fontSize:9,color:C.red,background:"none",border:"none",padding:0,marginTop:3,cursor:"pointer"}}>Delete</button></div></div>)}
       </div>
       <div>{cls?<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,overflow:"auto",boxShadow:C.shadow}}>
         <div style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`}}><div style={{fontWeight:700,fontSize:13,color:C.text}}>{cls.name} {cls.section&&`- Sec ${cls.section}`}</div>{cls.teacher&&<div style={{fontSize:11,color:C.muted}}>Teacher: {cls.teacher}</div>}</div>
@@ -3948,6 +4271,9 @@ function InstTimetable({inst,color,notify,C}){
         {Object.keys(subColors).length>0&&<div style={{padding:"10px 14px",borderTop:`1px solid ${C.border}`,display:"flex",gap:10,flexWrap:"wrap",background:C.bg}}>{Object.entries(subColors).map(([s2,c])=><div key={s2} style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:C.text}}><div style={{width:10,height:10,borderRadius:3,background:c}}/>{s2}</div>)}</div>}
       </div>:<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"50px",textAlign:"center",color:C.muted,boxShadow:C.shadow}}>Select or create a class</div>}</div>
     </div>
+    {editCls&&<EditModal title="Edit class" C={C} value={editCls} onClose={()=>setEditCls(null)} onSave={v=>{saveCls(classes.map(c=>c.id===v.id?{...c,name:v.name.trim(),section:v.section||"",teacher:v.teacher||""}:c));setEditCls(null);notify("Class saved");}} fields={[
+      {k:"name",label:"Class *",required:true,span:true},{k:"section",label:"Section"},{k:"teacher",label:"Class Teacher"},
+    ]}/>}
   </div>;
 }
 
@@ -4479,15 +4805,16 @@ function InstAnalytics({students,inst,color,db,C}){
 }
 
 // ─── PHASE 1: ONLINE EXAM SYSTEM ────────────────────────────────────────────
-function InstOnlineExams({students,inst,color,onUpdate,notify,C}){
+function InstOnlineExams({db,saveDb,students,inst,color,onUpdate,notify,C}){
   const STORE_KEY=`exams_${inst.id}`;
-  const [exams,setExams]=useState(()=>lsGet(STORE_KEY,[]));
+  const [exams,setExamList]=useInstList(db,saveDb,"onlineExams",inst.id,STORE_KEY);
   const [view,setView]=useState("list");
   const [editExam,setEditExam]=useState(null);
   const [grading,setGrading]=useState(null);
-  function saveExams(e){setExams(e);lsSet(STORE_KEY,e);}
+  function saveExams(e){setExamList(e);}
   function createExam(ex){saveExams([...exams,{...ex,id:uid(),createdAt:today(),submissions:[]}]);setView("list");notify("✅ Exam created!");}
   function deleteExam(id){if(!confirmDelete("this exam"))return;saveExams(exams.filter(e=>e.id!==id));notify("Deleted","error");}
+  function updateExam(ex){saveExams(exams.map(e=>e.id===editExam.id?{...e,...ex}:e));setEditExam(null);setView("list");notify("✅ Exam updated");}
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
       <PH title="💻 Online Exams" sub={`${exams.length} exam${exams.length!==1?"s":""} created`} C={C}/>
@@ -4505,24 +4832,28 @@ function InstOnlineExams({students,inst,color,onUpdate,notify,C}){
         </div>
         <div style={{display:"flex",gap:8,marginTop:12}}>
           <Btn onClick={()=>{setGrading(ex);setView("results");}} C={C} color="blue" size="sm" outline>📊 Results</Btn>
+          <Btn onClick={()=>{setEditExam(ex);setView("edit");}} C={C} color="teal" size="sm" outline>Edit</Btn>
           <Btn onClick={()=>deleteExam(ex.id)} C={C} color="red" size="sm" outline>Delete</Btn>
         </div>
       </div>;})}
       {!exams.length&&<Empty msg="No exams yet — create your first exam above" C={C}/>}
     </div>}
     {view==="create"&&<ExamCreator onSave={createExam} color={color} C={C}/>}
+    {view==="edit"&&editExam&&<ExamCreator key={editExam.id} initial={editExam} onSave={updateExam} color={color} C={C}/>}
     {view==="results"&&grading&&<ExamResults exam={grading} students={students} color={color} C={C} onUpdate={(id,subs)=>{const updated=exams.map(e=>e.id===id?{...e,submissions:subs}:e);saveExams(updated);setGrading(updated.find(e=>e.id===id));}}/>}
   </div>;
 }
 
-function ExamCreator({onSave,color,C}){
-  const [form,setForm]=useState({title:"",subject:"",duration:30,totalMarks:100,description:""});
-  const [questions,setQuestions]=useState([]);
+function ExamCreator({onSave,color,C,initial}){
+  const [form,setForm]=useState(()=>initial?{title:initial.title||"",subject:initial.subject||"",duration:initial.duration||30,totalMarks:initial.totalMarks||100,description:initial.description||""}:{title:"",subject:"",duration:30,totalMarks:100,description:""});
+  const [questions,setQuestions]=useState(()=>initial?(initial.questions||[]).map(q=>({...q,options:[...(q.options||[])]})):[]);
+  const [editQId,setEditQId]=useState(null);
   const [qForm,setQForm]=useState({question:"",options:["","","",""],correct:0,marks:5});
   const [aiLoading,setAiLoading]=useState(false);
   const examImportRef=useRef();
   const [examImportPreview,setExamImportPreview]=useState(null);
-  function addQ(){if(!qForm.question.trim()||!qForm.options[qForm.correct].trim())return;setQuestions(qs=>[...qs,{...qForm,id:uid()}]);setQForm({question:"",options:["","","",""],correct:0,marks:5});}
+  function addQ(){if(!qForm.question.trim()||!(qForm.options[qForm.correct]||"").trim())return;if(editQId){setQuestions(qs=>qs.map(q=>q.id===editQId?{...qForm,id:editQId}:q));setEditQId(null);}else setQuestions(qs=>[...qs,{...qForm,id:uid()}]);setQForm({question:"",options:["","","",""],correct:0,marks:5});}
+  function startEditQ(q){const o=[...(q.options||[])];while(o.length<4)o.push("");setQForm({question:q.question||"",options:o,correct:Number(q.correct)||0,marks:Number(q.marks)||5});setEditQId(q.id);}
   function removeQ(id){setQuestions(qs=>qs.filter(q=>q.id!==id));}
   function save(){if(!form.title||!form.subject||!questions.length){return;}const total=questions.reduce((a,q)=>a+Number(q.marks),0);onSave({...form,questions,totalMarks:total});}
 
@@ -4590,10 +4921,10 @@ function ExamCreator({onSave,color,C}){
         </div>
       </div>}
       {questions.map((q,i)=><div key={q.id} style={{padding:"10px 14px",background:C.bg,borderRadius:9,marginBottom:8,border:`1px solid ${C.border}`}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div style={{flex:1}}><div style={{fontWeight:600,fontSize:12,color:C.text}}>Q{i+1}. {q.question}</div><div style={{fontSize:11,color:C.muted,marginTop:4}}>{q.options.map((o,oi)=><span key={oi} style={{marginRight:12,color:oi===q.correct?C.green:C.muted,fontWeight:oi===q.correct?700:400}}>{String.fromCharCode(65+oi)}. {o}</span>)}</div></div><div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}><span style={{fontSize:11,color:color,fontWeight:700}}>{q.marks}m</span><Btn onClick={()=>removeQ(q.id)} C={C} color="red" size="sm" outline>✕</Btn></div></div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div style={{flex:1}}><div style={{fontWeight:600,fontSize:12,color:C.text}}>Q{i+1}. {q.question}</div><div style={{fontSize:11,color:C.muted,marginTop:4}}>{q.options.map((o,oi)=><span key={oi} style={{marginRight:12,color:oi===q.correct?C.green:C.muted,fontWeight:oi===q.correct?700:400}}>{String.fromCharCode(65+oi)}. {o}</span>)}</div></div><div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}><span style={{fontSize:11,color:color,fontWeight:700}}>{q.marks}m</span><Btn onClick={()=>startEditQ(q)} C={C} color="teal" size="sm" outline>{editQId===q.id?"Editing…":"Edit"}</Btn><Btn onClick={()=>{removeQ(q.id);if(editQId===q.id){setEditQId(null);setQForm({question:"",options:["","","",""],correct:0,marks:5});}}} C={C} color="red" size="sm" outline>✕</Btn></div></div>
       </div>)}
       <div style={{background:C.bg,borderRadius:9,padding:14,border:`1px solid ${C.border}`,marginTop:12}}>
-        <div style={{fontWeight:600,fontSize:12,marginBottom:10,color:C.text}}>Add Question</div>
+        <div style={{fontWeight:600,fontSize:12,marginBottom:10,color:editQId?C.teal:C.text}}>{editQId?`Editing question ${questions.findIndex(q=>q.id===editQId)+1}`:"Add Question"}</div>
         <Txt C={C} value={qForm.question} onChange={e=>setQForm(f=>({...f,question:e.target.value}))} placeholder="Enter question..." rows={2} style={{marginBottom:8}}/>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
           {qForm.options.map((o,i)=><div key={i} style={{display:"flex",gap:6,alignItems:"center"}}>
@@ -4601,10 +4932,10 @@ function ExamCreator({onSave,color,C}){
             <Inp C={C} value={o} onChange={e=>setQForm(f=>({...f,options:f.options.map((x,j)=>j===i?e.target.value:x)}))} placeholder={`Option ${String.fromCharCode(65+i)}`} style={{marginBottom:0}}/>
           </div>)}
         </div>
-        <div style={{display:"flex",gap:10,alignItems:"center"}}><span style={{fontSize:12,color:C.muted}}>Marks:</span><Inp C={C} type="number" value={qForm.marks} onChange={e=>setQForm(f=>({...f,marks:Number(e.target.value)}))} style={{width:70,marginBottom:0}} min={1}/><Btn onClick={addQ} C={C} color="teal" size="sm">+ Add</Btn></div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}><span style={{fontSize:12,color:C.muted}}>Marks:</span><Inp C={C} type="number" value={qForm.marks} onChange={e=>setQForm(f=>({...f,marks:Number(e.target.value)}))} style={{width:70,marginBottom:0}} min={1}/><Btn onClick={addQ} C={C} color="teal" size="sm">{editQId?"Save Question":"+ Add"}</Btn>{editQId&&<Btn onClick={()=>{setEditQId(null);setQForm({question:"",options:["","","",""],correct:0,marks:5});}} C={C} color="red" size="sm" outline>Cancel edit</Btn>}</div>
       </div>
     </div>
-    <Btn onClick={save} C={C} color="green" disabled={!form.title||!form.subject||!questions.length}>💾 Save Exam ({questions.length} questions, {questions.reduce((a,q)=>a+Number(q.marks),0)} marks)</Btn>
+    <Btn onClick={save} C={C} color="green" disabled={!form.title||!form.subject||!questions.length||!!editQId}>💾 {initial?"Save Changes":"Save Exam"} ({questions.length} questions, {questions.reduce((a,q)=>a+Number(q.marks),0)} marks)</Btn>
   </div>;
 }
 
@@ -4787,7 +5118,7 @@ function StuAIChat({stu:stuProp,inst,C}){
 }
 function InstLibrary({db,saveDb,inst,color,isAdmin,notify,C}){
   const KEY="lib_"+inst.id;
-  const [books,setBooks]=useState(()=>lsGet(KEY,[]));
+  const [books,setBookList]=useInstList(db,saveDb,"libraryBooks",inst.id,KEY);
   const [subTab,setSubTab]=useState("catalog");
   const [showAdd,setShowAdd]=useState(false);
   const blank={title:"",author:"",isbn:"",category:"",totalCopies:1,description:""};
@@ -4797,9 +5128,17 @@ function InstLibrary({db,saveDb,inst,color,isAdmin,notify,C}){
   const [issueStudent,setIssueStudent]=useState("");
   const myStudents=(db.students||[]).filter(s=>s.instId===inst.id);
   const CATS=["Mathematics","Science","English","History","Computer","Fiction","Reference","Other"];
-  function saveBooks(b){setBooks(b);lsSet(KEY,b);}
+  function saveBooks(b){setBookList(b);}
   function addBook(){if(!form.title||!form.author)return;saveBooks([...books,{...form,id:uid(),totalCopies:Number(form.totalCopies)||1,available:Number(form.totalCopies)||1,issues:[],addedAt:today()}]);setForm(blank);setShowAdd(false);notify("Book added!");}
   function delBook(id){if(!confirmDelete("this book"))return;saveBooks(books.filter(b=>b.id!==id));notify("Deleted","error");}
+  const [editBook,setEditBook]=useState(null);
+  function saveBook(v){
+    const total=Math.max(1,Number(v.totalCopies)||1);
+    const out=(v.issues||[]).filter(i=>!i.returned).length;
+    if(total<out){notify(`${out} cop${out===1?"y is":"ies are"} issued right now — total can't be less than that`,"error");return;}
+    saveBooks(books.map(b=>b.id===v.id?{...b,title:v.title.trim(),author:v.author.trim(),isbn:v.isbn||"",category:v.category||"",description:v.description||"",totalCopies:total,available:total-out}:b));
+    setEditBook(null);notify("Book saved");
+  }
   function issueBook(bookId){const stu=myStudents.find(s=>s.id===issueStudent);if(!stu){notify("Select a student","error");return;}const book=books.find(b=>b.id===bookId);if(!book||book.available<1){notify("No copies available","error");return;}const due=new Date(Date.now()+14*86400000).toISOString().slice(0,10);const issue={id:uid(),studentId:stu.id,studentName:stu.name,rollNo:stu.rollNo,issuedAt:today(),dueDate:due,returned:false};saveBooks(books.map(b=>b.id===bookId?{...b,available:b.available-1,issues:[...(b.issues||[]),issue]}:b));setIssueFor(null);setIssueStudent("");notify("Issued to "+stu.name+"!");}
   function returnBook(bookId,issueId){saveBooks(books.map(b=>b.id===bookId?{...b,available:b.available+1,issues:b.issues.map(i=>i.id===issueId?{...i,returned:true,returnedAt:today()}:i)}:b));notify("Book returned!");}
   const filtered=books.filter(b=>[b.title,b.author,b.isbn,b.category].some(v=>v&&v.toLowerCase().includes(search.toLowerCase())));
@@ -4834,6 +5173,7 @@ function InstLibrary({db,saveDb,inst,color,isAdmin,notify,C}){
           <div style={{display:"flex",gap:8,alignItems:"center",flexShrink:0}}>
             <div style={{textAlign:"center",padding:"5px 12px",background:book.available>0?C.greenL:C.redL,borderRadius:8}}><div style={{fontWeight:800,fontSize:14,color:book.available>0?C.green:C.red}}>{book.available}/{book.totalCopies}</div><div style={{fontSize:9,color:C.muted}}>Available</div></div>
             {isAdmin&&<Btn onClick={()=>{setIssueFor(book.id);setIssueStudent("");}} C={C} color="blue" size="sm" disabled={book.available<1}>Issue</Btn>}
+            {isAdmin&&<Btn onClick={()=>setEditBook(book)} C={C} color="teal" size="sm" outline>Edit</Btn>}
             {isAdmin&&<Btn onClick={()=>delBook(book.id)} C={C} color="red" size="sm" outline>Del</Btn>}
           </div>
         </div>
@@ -4864,20 +5204,25 @@ function InstLibrary({db,saveDb,inst,color,isAdmin,notify,C}){
       </div>)}
       {!overdue.length&&<Empty msg="No overdue books" C={C}/>}
     </div>}
+    {editBook&&<EditModal title="Edit book" C={C} value={editBook} onClose={()=>setEditBook(null)} onSave={saveBook} fields={[
+      {k:"title",label:"Title *",required:true,span:true},{k:"author",label:"Author *",required:true},{k:"isbn",label:"ISBN"},
+      {k:"category",label:"Category",type:"select",options:[["","-- Select --"],...CATS]},{k:"totalCopies",label:"Total Copies",type:"number"},
+      {k:"description",label:"Description",type:"textarea"},
+    ]}/>}
   </div>;
 }
 
 // ─── HR & PAYROLL ─────────────────────────────────────────────────────────────
 function InstPayroll({db,saveDb,inst,color,notify,C}){
   const KEY="payroll_"+inst.id;
-  const [records,setRecords]=useState(()=>lsGet(KEY,[]));
+  const [records,setRecordList]=useInstList(db,saveDb,"payroll",inst.id,KEY);
   const [showAdd,setShowAdd]=useState(false);
   const [month,setMonth]=useState(new Date().toISOString().slice(0,7));
   const staff=(db.users||[]).filter(u=>u.instId===inst.id&&u.role!=="admin"&&u.role!=="accountant");
   const ALLOWANCES=["HRA","Travel","Medical","Performance","Other"];
   const DEDUCTIONS=["PF","ESI","TDS","Advance","Other"];
   const [payForm,setPayForm]=useState({staffId:"",baseSalary:"",allowances:[],deductions:[],note:""});
-  function saveRecords(r){setRecords(r);lsSet(KEY,r);}
+  function saveRecords(r){setRecordList(r);}
   function addRecord(){
     if(!payForm.staffId||!payForm.baseSalary)return;
     const s=staff.find(u=>u.id===payForm.staffId);
@@ -4888,6 +5233,18 @@ function InstPayroll({db,saveDb,inst,color,notify,C}){
     setPayForm({staffId:"",baseSalary:"",allowances:[],deductions:[],note:""});
     setShowAdd(false);notify("Salary recorded for "+(s&&s.name));
   }
+  const [editPay,setEditPay]=useState(null);
+  function savePay(v){
+    const base=Number(v.baseSalary);
+    if(!(base>0)){notify("Enter the base salary","error");return;}
+    const allow=Number(v.extraAllow||0), ded=Number(v.extraDed||0);
+    // keep the itemised breakdown unless the total was changed in this dialog
+    const allowances=allow!==Number(v._origAllow||0)?[{type:"Total",amount:String(allow)}]:v.allowances;
+    const deductions=ded!==Number(v._origDed||0)?[{type:"Total",amount:String(ded)}]:v.deductions;
+    saveRecords(records.map(r=>r.id===v.id?{...r,month:v.month,baseSalary:base,allowances,deductions,gross:base+allow,net:base+allow-ded,note:v.note||"",paidAt:v.paidAt||r.paidAt,status:v.status||r.status}:r));
+    setEditPay(null);notify("Salary record saved");
+  }
+  const sumOf=list=>(list||[]).reduce((a,x)=>a+Number(x.amount||0),0);
   const monthRecords=records.filter(r=>r.month===month);
   const totalPaid=monthRecords.reduce((a,r)=>a+r.net,0);
   const TH={padding:"10px 14px",textAlign:"left",fontSize:10,fontWeight:600,color:C.muted,textTransform:"uppercase",borderBottom:"1px solid "+C.border,background:C.bg};
@@ -4937,12 +5294,18 @@ function InstPayroll({db,saveDb,inst,color,notify,C}){
             <td style={{...TD,color:C.red}}>-Rs {r.deductions&&r.deductions.reduce((a,x)=>a+Number(x.amount||0),0).toLocaleString()}</td>
             <td style={{...TD,fontWeight:800,color:C.teal}}>Rs {r.net&&r.net.toLocaleString()}</td>
             <td style={TD}>{fmt(r.paidAt)}</td>
-            <td style={TD}><Btn onClick={()=>{if(confirmDelete("this record"))saveRecords(records.filter(x=>x.id!==r.id));}} C={C} color="red" size="sm" outline>Del</Btn></td>
+            <td style={TD}><div style={{display:"flex",gap:6}}><Btn onClick={()=>{const a=sumOf(r.allowances),d=sumOf(r.deductions);setEditPay({...r,extraAllow:a,_origAllow:a,extraDed:d,_origDed:d});}} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{if(confirmDelete("this record"))saveRecords(records.filter(x=>x.id!==r.id));}} C={C} color="red" size="sm" outline>Del</Btn></div></td>
           </tr>)}
           {!monthRecords.length&&<tr><td colSpan={8}><Empty msg={"No salary records for "+month} C={C}/></td></tr>}
         </tbody>
       </table>
     </div>
+    {editPay&&<EditModal title={`Edit salary — ${editPay.staffName||""}`} C={C} value={editPay} onClose={()=>setEditPay(null)} onSave={savePay} fields={[
+      {k:"month",label:"Month",type:"month",required:true},{k:"paidAt",label:"Paid On",type:"date"},
+      {k:"baseSalary",label:"Base Salary (Rs) *",type:"number",required:true},{k:"status",label:"Status",type:"select",options:["Paid","Pending","On Hold"]},
+      {k:"extraAllow",label:"Total Allowances (Rs)",type:"number"},{k:"extraDed",label:"Total Deductions (Rs)",type:"number"},
+      {k:"note",label:"Note",span:true},
+    ]} danger="Net pay is recalculated as Base + Allowances − Deductions."/>}
   </div>;
 }
 
@@ -4977,6 +5340,14 @@ function InstLeave({db,saveDb,user,inst,color,isAdmin,notify,C}){
   }
   function approve(id){writeLeaves(allDbLeaves.map(l=>l.id===id?{...l,status:"Approved",reviewedAt:today(),reviewedBy:user.name}:l));notify("Leave approved!");}
   function reject(id){writeLeaves(allDbLeaves.map(l=>l.id===id?{...l,status:"Rejected",reviewedAt:today(),reviewedBy:user.name}:l));notify("Leave rejected","error");}
+  const [editLeave,setEditLeave]=useState(null);
+  function saveLeave(v){
+    if(v.to<v.from){notify("'To' date can't be before 'From' date","error");return;}
+    const days=Math.round((new Date(v.to)-new Date(v.from))/86400000)+1;
+    const statusChanged=isAdmin&&v.status!==editLeave.status;
+    writeLeaves(allDbLeaves.map(l=>l.id===v.id?{...l,type:v.type,from:v.from,to:v.to,reason:v.reason.trim(),days,status:isAdmin?v.status:l.status,...(statusChanged?{reviewedAt:today(),reviewedBy:user.name}:{})}:l));
+    setEditLeave(null);notify("Leave saved");
+  }
 
   // Only this institution's leaves. Records saved before instId existed are kept visible.
   const leaves=allDbLeaves.filter(l=>!l.instId||l.instId===inst.id);
@@ -5012,7 +5383,8 @@ function InstLeave({db,saveDb,user,inst,color,isAdmin,notify,C}){
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <Badge label={l.status} color={l.status==="Approved"?"green":l.status==="Rejected"?"red":"gold"} C={C}/>
             {l.status==="Pending"&&<><Btn onClick={()=>approve(l.id)} C={C} color="green" size="sm">Approve</Btn><Btn onClick={()=>reject(l.id)} C={C} color="red" size="sm" outline>Reject</Btn></>}
-            <Btn onClick={()=>writeLeaves(allDbLeaves.filter(x=>x.id!==l.id))} C={C} color="red" size="sm" outline>Del</Btn>
+            <Btn onClick={()=>setEditLeave(l)} C={C} color="teal" size="sm" outline>Edit</Btn>
+            <Btn onClick={()=>{if(confirmDelete("this leave record"))writeLeaves(allDbLeaves.filter(x=>x.id!==l.id));}} C={C} color="red" size="sm" outline>Del</Btn>
           </div>
         </div>
         {l.reviewedBy&&<div style={{fontSize:10,color:C.muted,marginTop:8}}>Reviewed by {l.reviewedBy} on {fmt(l.reviewedAt)}</div>}
@@ -5023,11 +5395,17 @@ function InstLeave({db,saveDb,user,inst,color,isAdmin,notify,C}){
       {myLeaves.map(l=><div key={l.id} style={{background:C.surface,borderRadius:10,border:"1px solid "+statusColor(l.status)+"44",padding:"14px 18px",boxShadow:C.shadow}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
           <div><div style={{fontWeight:700,fontSize:13,color:C.text}}>{l.type}</div><div style={{fontSize:11,color:C.muted}}>{fmt(l.from)} to {fmt(l.to)} - {l.days} day(s)</div><div style={{fontSize:11,color:C.muted,fontStyle:"italic",marginTop:2}}>{l.reason}</div></div>
-          <Badge label={l.status} color={l.status==="Approved"?"green":l.status==="Rejected"?"red":"gold"} C={C}/>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}><Badge label={l.status} color={l.status==="Approved"?"green":l.status==="Rejected"?"red":"gold"} C={C}/>{l.status==="Pending"&&<Btn onClick={()=>setEditLeave(l)} C={C} color="teal" size="sm" outline>Edit</Btn>}</div>
         </div>
       </div>)}
       {!myLeaves.length&&<Empty msg="No leave applications yet" C={C}/>}
     </div>}
+    {editLeave&&<EditModal title="Edit leave" C={C} value={editLeave} onClose={()=>setEditLeave(null)} onSave={saveLeave} fields={[
+      {k:"type",label:"Leave Type",type:"select",options:TYPES.includes(editLeave.type)?TYPES:[...TYPES,editLeave.type]},
+      {k:"status",label:"Status",type:"select",options:["Pending","Approved","Rejected"]},
+      {k:"from",label:"From Date",type:"date",required:true},{k:"to",label:"To Date",type:"date",required:true},
+      {k:"reason",label:"Reason *",type:"textarea",required:true},
+    ].filter(f=>isAdmin||f.k!=="status")}/>}
   </div>;
 }
 
@@ -5070,6 +5448,13 @@ function StuLeaveView({db,saveDb,stu,inst,C,notify}){
       days,status:"Pending",appliedAt:today()}]});
     setForm({type:"Sick Leave",from:"",to:"",reason:""});notify("Leave application submitted!");
   }
+  const [editLeave,setEditLeave]=useState(null);
+  function saveLeave(v){
+    if(v.to<v.from){notify("'To' date can't be before 'From' date","error");return;}
+    const days=Math.round((new Date(v.to)-new Date(v.from))/86400000)+1;
+    saveDb({leaves:allDbLeaves.map(l=>l.id===v.id&&l.status==="Pending"?{...l,type:v.type,from:v.from,to:v.to,reason:v.reason.trim(),days}:l)});
+    setEditLeave(null);notify("Application updated");
+  }
   const myLeaves=allDbLeaves.filter(l=>(l.applicantId||l.studentId)===stu.id).slice().sort((a,b)=>String(b.appliedAt||"").localeCompare(String(a.appliedAt||"")));
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="Leave Application" sub="Apply and track your leave requests" C={C}/>
@@ -5088,12 +5473,17 @@ function StuLeaveView({db,saveDb,stu,inst,C,notify}){
         <div style={{fontWeight:700,fontSize:13,marginBottom:14,color:C.text}}>My Applications</div>
         <div style={{display:"flex",flexDirection:"column",gap:8}}>
           {myLeaves.map(l=><div key={l.id} style={{padding:"10px 14px",background:C.bg,borderRadius:9,border:"1px solid "+C.border}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{l.type}</div><div style={{fontSize:10,color:C.muted}}>{fmt(l.from)} to {fmt(l.to)} - {l.days}d</div></div><Badge label={l.status} color={l.status==="Approved"?"green":l.status==="Rejected"?"red":"gold"} C={C}/></div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{l.type}</div><div style={{fontSize:10,color:C.muted}}>{fmt(l.from)} to {fmt(l.to)} - {l.days}d</div></div><div style={{display:"flex",gap:6,alignItems:"center"}}><Badge label={l.status} color={l.status==="Approved"?"green":l.status==="Rejected"?"red":"gold"} C={C}/>{l.status==="Pending"&&<Btn onClick={()=>setEditLeave(l)} C={C} color="teal" size="sm" outline>Edit</Btn>}</div></div>
           </div>)}
           {!myLeaves.length&&<Empty msg="No applications yet" C={C}/>}
         </div>
       </div>
     </div>
+    {editLeave&&<EditModal title="Edit leave application" C={C} value={editLeave} onClose={()=>setEditLeave(null)} onSave={saveLeave} fields={[
+      {k:"type",label:"Type",type:"select",options:TYPES.includes(editLeave.type)?TYPES:[...TYPES,editLeave.type]},
+      {k:"from",label:"From",type:"date",required:true},{k:"to",label:"To",type:"date",required:true},
+      {k:"reason",label:"Reason *",type:"textarea",required:true},
+    ]}/>}
   </div>;
 }
 
@@ -5101,16 +5491,22 @@ function StuLeaveView({db,saveDb,stu,inst,C,notify}){
 // ─── DOCUMENT MANAGEMENT ─────────────────────────────────────────────────────
 function InstDocs({db,saveDb,inst,color,isAdmin,notify,C}){
   const KEY="docs_"+inst.id;
-  const [docs,setDocs]=useState(()=>lsGet(KEY,[]));
+  const [docs,setDocList]=useInstList(db,saveDb,"documents",inst.id,KEY);
   const [showAdd,setShowAdd]=useState(false);
   const [form,setForm]=useState({title:"",category:"",description:"",url:"",studentId:""});
   const [filter,setFilter]=useState("all");
   const [search,setSearch]=useState("");
   const CATS=["TC","Marksheet","Aadhaar","Birth Certificate","Character Certificate","Fee Receipt","Bonafide","Other"];
   const myStudents=(db.students||[]).filter(s=>s.instId===inst.id);
-  function saveDocs(d){setDocs(d);lsSet(KEY,d);}
+  function saveDocs(d){setDocList(d);}
   function addDoc(){if(!form.title||!form.category)return;saveDocs([...docs,{...form,id:uid(),uploadedAt:today()}]);setForm({title:"",category:"",description:"",url:"",studentId:""});setShowAdd(false);notify("Document added!");}
   function delDoc(id){if(!confirmDelete("this document"))return;saveDocs(docs.filter(d=>d.id!==id));notify("Deleted","error");}
+  const [editDoc,setEditDoc]=useState(null);
+  function saveDoc(v){
+    if(v.url&&!/^https?:\/\//i.test(v.url.trim())){notify("The file link must start with http","error");return;}
+    saveDocs(docs.map(d=>d.id===v.id?{...d,title:v.title.trim(),category:v.category,studentId:v.studentId||"",url:(v.url||"").trim(),description:v.description||""}:d));
+    setEditDoc(null);notify("Document saved");
+  }
   const filtered=docs.filter(d=>{const matchCat=filter==="all"||d.category===filter;const matchQ=[d.title,d.description,d.category].some(v=>v&&v.toLowerCase().includes(search.toLowerCase()));return matchCat&&matchQ;});
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
@@ -5143,11 +5539,17 @@ function InstDocs({db,saveDb,inst,color,isAdmin,notify,C}){
         <div style={{fontSize:10,color:C.muted,marginBottom:10}}>Added: {fmt(doc.uploadedAt)}</div>
         <div style={{display:"flex",gap:8}}>
           {doc.url&&<a href={doc.url} target="_blank" rel="noreferrer" style={{flex:1,padding:"6px 12px",borderRadius:7,background:color,color:"#fff",fontSize:11,fontWeight:700,textAlign:"center",textDecoration:"none"}}>Open File</a>}
+          {isAdmin&&<Btn onClick={()=>setEditDoc(doc)} C={C} color="teal" size="sm" outline>Edit</Btn>}
           {isAdmin&&<Btn onClick={()=>delDoc(doc.id)} C={C} color="red" size="sm" outline>Del</Btn>}
         </div>
       </div>;})}
       {!filtered.length&&<div style={{gridColumn:"1/-1"}}><Empty msg="No documents found" C={C}/></div>}
     </div>
+    {editDoc&&<EditModal title="Edit document" C={C} value={editDoc} onClose={()=>setEditDoc(null)} onSave={saveDoc} fields={[
+      {k:"title",label:"Document Title *",required:true},{k:"category",label:"Category *",type:"select",required:true,options:[["","-- Select --"],...CATS]},
+      {k:"studentId",label:"Linked Student",type:"select",options:[["","-- General Document --"],...myStudents.map(s=>[s.id,`${s.name} (${s.rollNo||"--"})`])]},
+      {k:"url",label:"File URL"},{k:"description",label:"Notes",span:true},
+    ]}/>}
   </div>;
 }
 
@@ -5509,6 +5911,13 @@ function InstBatches({db,saveDb,user,inst,color,notify,C}){
     saveDb({batches:(db.batches||[]).map(x=>x.id===b.id?{...x,password:code}:x)});
     notify(code?"Access code updated":"Lock removed");
   }
+  const [editBatch,setEditBatch]=useState(null);
+  function saveBatch(v){
+    const nm=v.name.trim();
+    if(batches.some(x=>x.id!==v.id&&x.name.toLowerCase()===nm.toLowerCase())){notify("Another batch already has that name","error");return;}
+    saveDb({batches:patchById(db.batches,v.id,{name:nm,password:(v.password||"").trim()})});
+    setEditBatch(null);notify("Batch saved");
+  }
   function delBatch(b){
     if(!confirmDelete(`batch "${b.name}"`))return;
     saveDb({
@@ -5540,6 +5949,7 @@ function InstBatches({db,saveDb,user,inst,color,notify,C}){
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
               <Btn onClick={()=>setBatchCode(b)} C={C} color={b.password?"gold":"teal"} size="sm" outline>{b.password?"🔒 Code":"🔓 Set Code"}</Btn>
               <Btn onClick={()=>{setOpenId(open?null:b.id);setQ("");}} C={C} color="blue" size="sm" outline>{open?"Done":"Assign Students"}</Btn>
+              <Btn onClick={()=>setEditBatch(b)} C={C} color="teal" size="sm" outline>Edit</Btn>
               <Btn onClick={()=>delBatch(b)} C={C} color="red" size="sm" outline>🗑</Btn>
             </div>
           </div>
@@ -5562,6 +5972,10 @@ function InstBatches({db,saveDb,user,inst,color,notify,C}){
         </div>;
       })}
     </div>
+    {editBatch&&<EditModal title="Edit batch" C={C} value={editBatch} onClose={()=>setEditBatch(null)} onSave={saveBatch} fields={[
+      {k:"name",label:"Batch Name *",required:true,span:true},
+      {k:"password",label:"Access Code (blank = no lock)",span:true},
+    ]}/>}
   </div>;
 }
 
@@ -5600,11 +6014,26 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
   const [importPreview,setImportPreview]=useState(null); // {qs, errors}
   const [showImport,setShowImport]=useState(false);
 
+  const [editingId,setEditingId]=useState(null); // test being edited (null = creating new)
+  const [editQId,setEditQId]=useState(null);       // question being edited in the form below
+  const blankQ={question:"",options:["","","",""],correct:0,marks:1,explanation:""};
   function addQ(){
-    if(!qForm.question.trim()||!qForm.options[qForm.correct].trim()){notify("Enter the question and fill the correct option","error");return;}
-    setQs(x=>[...x,{...qForm,id:uid()}]); setQForm({question:"",options:["","","",""],correct:0,marks:1,explanation:""});
+    if(!qForm.question.trim()||!(qForm.options[qForm.correct]||"").trim()){notify("Enter the question and fill the correct option","error");return;}
+    if(editQId){ setQs(x=>x.map(q=>q.id===editQId?{...qForm,id:editQId}:q)); setEditQId(null); }
+    else setQs(x=>[...x,{...qForm,id:uid()}]);
+    setQForm(blankQ);
   }
-  function removeQ(id){setQs(x=>x.filter(q=>q.id!==id));}
+  function startEditQ(q){
+    const opts=[...(q.options||[])]; while(opts.length<4) opts.push("");
+    setQForm({question:q.question||"",options:opts,correct:Number(q.correct)||0,marks:Number(q.marks)||1,explanation:q.explanation||""});
+    setEditQId(q.id);
+  }
+  function removeQ(id){setQs(x=>x.filter(q=>q.id!==id));if(editQId===id){setEditQId(null);setQForm(blankQ);}}
+  function startEditTest(t){
+    setForm({title:t.title||"",subject:t.subject||"",batchId:t.batchId||"",description:t.description||"",mode:t.mode||"mcq"});
+    setQs((t.questions||[]).map(q=>({...q,options:[...(q.options||[])]})));
+    setQForm(blankQ);setEditQId(null);setEditingId(t.id);setView("create");
+  }
 
   // ── Import questions from CSV / JSON / Excel / Word / PDF ──
   async function handleImportFile(e){
@@ -5681,7 +6110,18 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
   function createTest(){
     if(!form.title.trim()||!form.subject.trim()){notify("Title and subject are required","error");return;}
     if(!qs.length){notify("Add at least one question","error");return;}
+    if(editQId){notify("Save or cancel the question you're editing first","error");return;}
     const total=qs.reduce((a,q)=>a+(Number(q.marks)||1),0);
+    if(editingId){
+      // Save edits and re-mark existing attempts against the updated answer key
+      saveDb({tests:(db.tests||[]).map(t=>{
+        if(t.id!==editingId) return t;
+        const attempts=(t.attempts||[]).map(a=>{const g=gradeTest({questions:qs},a.answers||{});return {...a,score:g.score,correctCount:g.correct,total,qCount:qs.length};});
+        return {...t,...form,questions:qs,totalMarks:total,attempts,editedBy:user.name,editedAt:new Date().toISOString()};
+      })});
+      setEditingId(null);setForm(blank);setQs([]);setView("list");notify("✅ Test updated");
+      return;
+    }
     saveDb({tests:[...(db.tests||[]),{...form,id:uid(),instId:inst.id,questions:qs,totalMarks:total,createdBy:user.name,createdAt:new Date().toISOString(),attempts:[]}]});
     setForm(blank);setQs([]);setView("list");notify("✅ Test published for students!");
   }
@@ -5692,8 +6132,8 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
       <PH title="📝 Tests" sub="Create MCQ tests — students answer in the app and see their rank" C={C}/>
-      {view==="list"&&<Btn onClick={()=>{setView("create");setForm(blank);setQs([]);}} C={C} color="purple">+ Create Test</Btn>}
-      {view!=="list"&&<Btn onClick={()=>{setView("list");setActiveId(null);}} C={C} color="red" outline>← Back</Btn>}
+      {view==="list"&&<Btn onClick={()=>{setView("create");setForm(blank);setQs([]);setEditingId(null);setEditQId(null);setQForm(blankQ);}} C={C} color="purple">+ Create Test</Btn>}
+      {view!=="list"&&<Btn onClick={()=>{setView("list");setActiveId(null);setEditingId(null);setEditQId(null);}} C={C} color="red" outline>← Back</Btn>}
     </div>
 
     {view==="list"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -5707,6 +6147,7 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
         </div>
         <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
           <Btn onClick={()=>{setActiveId(t.id);setView("results");}} C={C} color="blue" size="sm" outline>🏆 Results & Leaderboard</Btn>
+          <Btn onClick={()=>startEditTest(t)} C={C} color="teal" size="sm" outline>Edit</Btn>
           <Btn onClick={()=>delTest(t.id)} C={C} color="red" size="sm" outline>Delete</Btn>
         </div>
       </div>;})}
@@ -5715,7 +6156,8 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
 
     {view==="create"&&<div>
       <div style={{background:C.surface,borderRadius:12,border:`1px solid ${C.border}`,padding:20,marginBottom:16,boxShadow:C.shadow}}>
-        <div style={{fontWeight:700,fontSize:14,marginBottom:14,color:C.text}}>Test Details</div>
+        <div style={{fontWeight:700,fontSize:14,marginBottom:14,color:C.text}}>{editingId?"Edit Test":"Test Details"}</div>
+        {editingId&&(()=>{const n=((db.tests||[]).find(t=>t.id===editingId)?.attempts||[]).length;return n?<div style={{background:C.goldL,color:C.gold,borderRadius:8,padding:"8px 12px",fontSize:12,marginBottom:12}}>{n} student{n!==1?"s have":" has"} already attempted this test. When you save, their scores are recalculated using the updated questions and answers.</div>:null;})()}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
           <FG label="Test Title *" C={C} span><Inp C={C} value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))} placeholder="e.g. Unit 1 Quiz — Mathematics"/></FG>
           <FG label="Subject *" C={C}><Inp C={C} value={form.subject} onChange={e=>setForm(f=>({...f,subject:e.target.value}))} placeholder="Subject"/></FG>
@@ -5770,10 +6212,11 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
         {qs.map((q,i)=><div key={q.id} style={{padding:"10px 14px",background:C.bg,borderRadius:9,marginBottom:8,border:`1px solid ${C.border}`}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
             <div style={{flex:1}}><div style={{fontWeight:600,fontSize:12,color:C.text}}>Q{i+1}. {q.question}</div><div style={{fontSize:11,marginTop:4}}>{q.options.map((o,oi)=>o.trim()&&<span key={oi} style={{marginRight:12,color:oi===q.correct?C.green:C.muted,fontWeight:oi===q.correct?700:400}}>{String.fromCharCode(65+oi)}. {o}{oi===q.correct?" ✓":""}</span>)}</div>{q.explanation&&<div style={{fontSize:10.5,color:C.muted,marginTop:4,fontStyle:"italic"}}>💡 {q.explanation}</div>}</div>
-            <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}><span style={{fontSize:11,color:C.purple,fontWeight:700}}>{q.marks}m</span><Btn onClick={()=>removeQ(q.id)} C={C} color="red" size="sm" outline>✕</Btn></div>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}><span style={{fontSize:11,color:C.purple,fontWeight:700}}>{q.marks}m</span><Btn onClick={()=>startEditQ(q)} C={C} color="teal" size="sm" outline>{editQId===q.id?"Editing…":"Edit"}</Btn><Btn onClick={()=>removeQ(q.id)} C={C} color="red" size="sm" outline>✕</Btn></div>
           </div>
         </div>)}
-        <div style={{background:C.bg,borderRadius:9,padding:14,border:`1px dashed ${C.border}`,marginTop:12}}>
+        <div style={{background:C.bg,borderRadius:9,padding:14,border:`1px ${editQId?"solid":"dashed"} ${editQId?C.teal:C.border}`,marginTop:12}}>
+          {editQId&&<div style={{fontSize:12,fontWeight:700,color:C.teal,marginBottom:8}}>Editing question {qs.findIndex(q=>q.id===editQId)+1}</div>}
           <FG label="Question" C={C}><Inp C={C} value={qForm.question} onChange={e=>setQForm(f=>({...f,question:e.target.value}))} placeholder="Type the question"/></FG>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,margin:"10px 0"}}>
             {qForm.options.map((o,oi)=><div key={oi} onClick={()=>setQForm(f=>({...f,correct:oi}))} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}} title="Click the circle to mark the correct answer">
@@ -5784,12 +6227,13 @@ function InstTests({db,saveDb,user,inst,color,notify,C}){
           <FG label="Explanation (optional) — shown to students with the answer" C={C}><Inp C={C} value={qForm.explanation} onChange={e=>setQForm(f=>({...f,explanation:e.target.value}))} placeholder="Why this answer is correct…"/></FG>
           <div style={{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap",marginTop:10}}>
             <div style={{width:120}}><LBL C={C}>Marks</LBL><Inp C={C} type="number" min={1} value={qForm.marks} onChange={e=>setQForm(f=>({...f,marks:Number(e.target.value)||1}))}/></div>
-            <Btn onClick={addQ} C={C} color="teal">+ Add Question</Btn>
+            <Btn onClick={addQ} C={C} color="teal">{editQId?"Save Question":"+ Add Question"}</Btn>
+            {editQId&&<Btn onClick={()=>{setEditQId(null);setQForm(blankQ);}} C={C} color="red" outline>Cancel edit</Btn>}
             <span style={{fontSize:11,color:C.muted}}>Tip: click an option's circle to set the correct answer.</span>
           </div>
         </div>
       </div>
-      <Btn onClick={createTest} C={C} color="purple">📤 Publish Test</Btn>
+      <Btn onClick={createTest} C={C} color="purple">{editingId?"💾 Save Changes":"📤 Publish Test"}</Btn>
     </div>}
 
     {view==="results"&&active&&<div>
@@ -6107,6 +6551,8 @@ function InstNotes({db,saveDb,user,inst,color,notify,C}){
   const [uploadError,setUploadError]=useState("");   // persistent setup-error hint
   const [openFolder,setOpenFolder]=useState(null); // null = folder grid
   const [viewing,setViewing]=useState(null);        // attachment shown in secure viewer
+  const [editNoteId,setEditNoteId]=useState(null);  // note being edited (null = new note)
+  const [renameFolder,setRenameFolder]=useState(null);
   const fileRef=useRef();
   const LINK_TYPES=[["pdf","📄 PDF"],["drive","🟢 Drive"],["doc","📝 DOC"],["link","🔗 Link"]];
 
@@ -6149,8 +6595,32 @@ function InstNotes({db,saveDb,user,inst,color,notify,C}){
     if(!links.length&&!attachments.length){notify("Upload a file or add a link","error");return;}
     if(links.some(l=>!l.url.startsWith("http"))){notify("Each link must start with http","error");return;}
     const category=(form.category||"").trim()||"General";
+    if(editNoteId){
+      const orig=(db.notes||[]).find(x=>x.id===editNoteId);
+      saveDb({notes:patchById(db.notes,editNoteId,{title:form.title.trim(),subject:form.subject||"",category,batchId:form.batchId||"",description:form.description||"",links,attachments,editedBy:user.name,editedAt:new Date().toISOString()})});
+      // files removed during the edit are deleted from storage (best-effort)
+      const keep=new Set(attachments.map(a=>a.path).filter(Boolean));
+      (orig?.attachments||[]).forEach(a=>{ if(a.path&&!keep.has(a.path)) deleteNoteFile(a.path); });
+      setEditNoteId(null);setForm(blank);setShowAdd(false);setAddMode("file");setOpenFolder(category);notify("📒 Note saved");
+      return;
+    }
     saveDb({notes:[...(db.notes||[]),{...form,category,links,attachments,id:uid(),instId:inst.id,createdBy:user.name,createdAt:new Date().toISOString()}]});
     setForm(blank);setShowAdd(false);setAddMode("file");notify("📒 Note added!");
+  }
+  function startEdit(n){
+    const links=(n.links||[]).length?(n.links||[]).map(l=>({...l})):[{type:"pdf",url:""}];
+    const hasLinks=(n.links||[]).length>0, hasFiles=(n.attachments||[]).length>0;
+    setForm({title:n.title||"",subject:n.subject||"",category:n.category||"",batchId:n.batchId||"",description:n.description||"",links,attachments:[...(n.attachments||[])]});
+    setAddMode(hasLinks&&hasFiles?"both":hasLinks?"link":"file");
+    setEditNoteId(n.id);setShowAdd(true);
+    try{window.scrollTo({top:0,behavior:"smooth"});}catch(e){}
+  }
+  function saveFolderName(v){
+    const nm=(v.name||"").trim();
+    if(!nm){notify("Folder name can't be empty","error");return;}
+    const from=renameFolder;
+    saveDb({notes:(db.notes||[]).map(x=>x.instId===inst.id&&((x.category||"General").trim()||"General")===from?{...x,category:nm}:x)});
+    setRenameFolder(null);setOpenFolder(nm);notify("Folder renamed");
   }
   async function del(n){
     if(!confirmDelete("this note"))return;
@@ -6171,10 +6641,10 @@ function InstNotes({db,saveDb,user,inst,color,notify,C}){
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
       <PH title="📒 Notes" sub="Organise study material in folders — upload PDFs & Word files (view-only, no download) or paste links" C={C}/>
-      <Btn onClick={()=>{setShowAdd(s=>!s);setForm(blank);setAddMode("file");}} C={C} color="green">+ Add Note</Btn>
+      <Btn onClick={()=>{setShowAdd(s=>editNoteId?true:!s);setEditNoteId(null);setForm(blank);setAddMode("file");}} C={C} color="green">+ Add Note</Btn>
     </div>
     {showAdd&&<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:22,marginBottom:20,boxShadow:C.shadow}}>
-      <div style={{fontWeight:700,fontSize:14,color:C.text,marginBottom:14}}>New Note</div>
+      <div style={{fontWeight:700,fontSize:14,color:C.text,marginBottom:14}}>{editNoteId?"Edit Note":"New Note"}</div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:8}}>
         <FG label="Title *" C={C}><Inp C={C} value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))} placeholder="e.g. Chapter 5 — Notes"/></FG>
         <FG label="Subject" C={C}><Inp C={C} value={form.subject} onChange={e=>setForm(f=>({...f,subject:e.target.value}))} placeholder="Subject"/></FG>
@@ -6238,8 +6708,8 @@ function InstNotes({db,saveDb,user,inst,color,notify,C}){
       </div>}
 
       <div style={{display:"flex",gap:10,marginTop:6}}>
-        <Btn onClick={save} C={C} color="green" disabled={uploading}>Save Note</Btn>
-        <Btn onClick={()=>{setShowAdd(false);setForm(blank);}} C={C} color="red" outline>Cancel</Btn>
+        <Btn onClick={save} C={C} color="green" disabled={uploading}>{editNoteId?"Save Changes":"Save Note"}</Btn>
+        <Btn onClick={()=>{setShowAdd(false);setForm(blank);setEditNoteId(null);}} C={C} color="red" outline>Cancel</Btn>
       </div>
     </div>}
 
@@ -6259,12 +6729,13 @@ function InstNotes({db,saveDb,user,inst,color,notify,C}){
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
         <Btn onClick={()=>setOpenFolder(null)} C={C} color="red" size="sm" outline>← Folders</Btn>
         <div style={{fontWeight:800,fontSize:16,color:C.text}}>📁 {openFolder}</div>
+        <Btn onClick={()=>setRenameFolder(openFolder)} C={C} color="teal" size="sm" outline>Rename folder</Btn>
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:16}}>
         {shown.map(n=><div key={n.id} style={{background:C.surface,borderRadius:14,border:`1px solid ${C.border}`,borderTop:`3px solid ${C.green}`,padding:18,boxShadow:C.shadow,display:"flex",flexDirection:"column",gap:8}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
             <div style={{flex:1}}><div style={{fontWeight:800,fontSize:14,color:C.text}}>{n.title}</div>{n.subject&&<div style={{fontSize:11,color:C.muted,marginTop:2}}>📘 {n.subject}</div>}<div style={{marginTop:6}}><Badge label={batchName(n.batchId)} color={n.batchId?"blue":"green"} C={C}/></div></div>
-            <Btn onClick={()=>del(n)} C={C} color="red" size="sm" outline>🗑</Btn>
+            <div style={{display:"flex",gap:6,flexShrink:0}}><Btn onClick={()=>startEdit(n)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>del(n)} C={C} color="red" size="sm" outline>🗑</Btn></div>
           </div>
           {n.description&&<div style={{fontSize:12,color:C.muted,lineHeight:1.5}}>{n.description}</div>}
           <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:4}}>
@@ -6277,6 +6748,9 @@ function InstNotes({db,saveDb,user,inst,color,notify,C}){
     </div>}
 
     {viewing&&<SecureDocViewer att={viewing} watermark={inst.name+" · "+user.name} C={C} onClose={()=>setViewing(null)}/>}
+    {renameFolder&&<EditModal title="Rename folder" C={C} value={{name:renameFolder}} onClose={()=>setRenameFolder(null)} onSave={saveFolderName} saveLabel="Rename" fields={[
+      {k:"name",label:"Folder name *",required:true,span:true},
+    ]} danger={`All ${(folders[renameFolder]||[]).length} note(s) in this folder will move to the new name.`}/>}
   </div>;
 }
 
@@ -6347,6 +6821,12 @@ function InstQuestions({db,saveDb,user,inst,color,notify,C}){
     setForm(blank);setShowAdd(false);notify("❓ Question added!");
   }
   function del(id){if(!confirmDelete("this question"))return;saveDb({questions:(db.questions||[]).filter(q=>q.id!==id)});notify("Deleted","error");}
+  const [editQ,setEditQ]=useState(null);
+  function saveQ(v){
+    if((v.link||"").trim()&&!v.link.trim().startsWith("http")){notify("Link must start with http","error");return;}
+    saveDb({questions:patchById(db.questions,v.id,{subject:v.subject||"",batchId:v.batchId||"",body:v.body.trim(),answer:(v.answer||"").trim(),link:(v.link||"").trim()})});
+    setEditQ(null);notify("Question saved");
+  }
   const batchName=(id)=>id?(batches.find(b=>b.id===id)?.name||"Unknown batch"):"All batches";
 
   return <div style={{animation:"fadeUp 0.4s ease"}}>
@@ -6378,11 +6858,16 @@ function InstQuestions({db,saveDb,user,inst,color,notify,C}){
             {q.link&&<a href={q.link} target="_blank" rel="noreferrer" style={{fontSize:11,color:C.blue,fontWeight:600,marginTop:6,display:"inline-block"}}>🔗 Attachment</a>}
             <div style={{fontSize:9,color:C.muted,marginTop:6}}>By {q.createdBy} · {fmt((q.createdAt||"").slice(0,10))}</div>
           </div>
-          <Btn onClick={()=>del(q.id)} C={C} color="red" size="sm" outline>🗑</Btn>
+          <div style={{display:"flex",gap:6,flexShrink:0}}><Btn onClick={()=>setEditQ(q)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>del(q.id)} C={C} color="red" size="sm" outline>🗑</Btn></div>
         </div>
       </div>)}
       {!questions.length&&<Empty msg="No questions yet — add one above" C={C}/>}
     </div>
+    {editQ&&<EditModal title="Edit question" C={C} value={editQ} onClose={()=>setEditQ(null)} onSave={saveQ} fields={[
+      {k:"subject",label:"Subject"},{k:"batchId",label:"Visible to",type:"select",options:[["","All batches"],...batches.map(b=>[b.id,b.name])]},
+      {k:"body",label:"Question *",type:"textarea",required:true},{k:"answer",label:"Answer / Solution",type:"textarea",rows:2},
+      {k:"link",label:"Attachment link",span:true},
+    ]}/>}
   </div>;
 }
 
