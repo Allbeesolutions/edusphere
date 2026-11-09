@@ -911,7 +911,7 @@ function SuperAdmin({db,saveDb,onLogout,notify,user,C,dark,setDark}){
       <div style={{flex:1,padding:24,overflowY:"auto"}}>
         {tab==="overview"&&<SAOverview db={db} C={C}/>}
         {tab==="institutions"&&<SAInst db={db} onAdd={addInst} onUpdate={updInst} onDelete={delInst} C={C}/>}
-        {tab==="users"&&<SAUsers db={db} onAdd={addUser} onDelete={delUser} onUpdate={updUser} C={C}/>}
+        {tab==="users"&&<SAUsers db={db} onAdd={addUser} onDelete={delUser} onUpdate={updUser} notify={notify} onOpenBilling={()=>setTab("billing")} C={C}/>}
         {tab==="students"&&<SAStudents db={db} C={C}/>}
         {tab==="whitelabel"&&<SAWhiteLabel db={db} onUpdate={updInst} C={C}/>}
         {tab==="billing"&&<SABilling db={db} saveDb={saveDb} notify={notify} C={C}/>}
@@ -1223,13 +1223,15 @@ function SAInst({db,onAdd,onUpdate,onDelete,C}){
     </div>
   </div>;
 }
-function SAUsers({db,onAdd,onDelete,onUpdate,C}){
+function SAUsers({db,onAdd,onDelete,onUpdate,notify,onOpenBilling,C}){
+  const cfgR=remindCfg(db);
   const [editUser,setEditUser]=useState(null);
   const [showAdd,setShowAdd]=useState(false);const blank={name:"",username:"",password:"",email:"",role:"admin",instId:""};const [form,setForm]=useState(blank);
   function submit(){if(!form.name||!form.username||!form.password)return;onAdd(form);setForm(blank);setShowAdd(false);}
   const TH={padding:"10px 16px",textAlign:"left",fontSize:10,fontWeight:600,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",borderBottom:`1px solid ${C.border}`,background:C.bg||"#f2f4f6"};
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}><PH title="👤 Users" sub="Admin and staff accounts" C={C}/><Btn onClick={()=>setShowAdd(s=>!s)} C={C} color="purple">+ Create User</Btn></div>
+    <SubReminderPanel db={db} notify={notify} C={C} onOpenBilling={onOpenBilling}/>
     {showAdd&&<div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:20,marginBottom:18,boxShadow:C.shadow,animation:"fadeIn 0.3s ease"}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:12}}>
         <FG label="Full Name *" C={C}><Inp C={C} value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Full name"/></FG>
@@ -1243,9 +1245,9 @@ function SAUsers({db,onAdd,onDelete,onUpdate,C}){
     </div>}
     <div style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,overflow:"hidden",boxShadow:C.shadow}}>
       <table style={{width:"100%",borderCollapse:"collapse"}}>
-        <thead><tr>{["User","Username","Role","Institution","Actions"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
-        <tbody>{db.users.filter(u=>u.role!=="superadmin").map(u=>{const inst=db.institutions.find(i=>i.id===u.instId);return<tr key={u.id} style={{borderBottom:`1px solid ${C.border}`}}><td style={{padding:"11px 16px"}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={u.name} color={u.role==="admin"?C.teal:C.green} size={30}/><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{u.name}</div><div style={{fontSize:10,color:C.muted}}>{u.email}</div></div></div></td><td style={{padding:"11px 16px",fontFamily:"monospace",fontSize:12,color:C.teal}}>{u.username}</td><td style={{padding:"11px 16px"}}><Badge label={u.role} color={u.role==="admin"?"teal":u.role==="accountant"?"gold":u.role==="staff"?"blue":"green"} C={C}/></td><td style={{padding:"11px 16px",fontSize:12,color:C.muted}}>{inst?.name?.slice(0,22)||"--"}</td><td style={{padding:"11px 16px"}}><div style={{display:"flex",gap:6}}><Btn onClick={()=>setEditUser(u)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{const np=window.prompt("New password:",u.password);if(np)onUpdate(u.id,{password:np});}} C={C} color="gold" size="sm" outline>Reset Pwd</Btn><Btn onClick={()=>{if(confirmDelete(u.name))onDelete(u.id);}} C={C} color="red" size="sm" outline>Delete</Btn></div></td></tr>;})}
-        {!db.users.filter(u=>u.role!=="superadmin").length&&<tr><td colSpan={5}><Empty msg="No users" C={C}/></td></tr>}</tbody>
+        <thead><tr>{["User","Username","Role","Institution","Subscription","Actions"].map(h=><th key={h} style={TH}>{h}</th>)}</tr></thead>
+        <tbody>{db.users.filter(u=>u.role!=="superadmin").map(u=>{const inst=db.institutions.find(i=>i.id===u.instId);return<tr key={u.id} style={{borderBottom:`1px solid ${C.border}`}}><td style={{padding:"11px 16px"}}><div style={{display:"flex",alignItems:"center",gap:9}}><Avatar name={u.name} color={u.role==="admin"?C.teal:C.green} size={30}/><div><div style={{fontWeight:600,fontSize:12,color:C.text}}>{u.name}</div><div style={{fontSize:10,color:C.muted}}>{u.email}</div></div></div></td><td style={{padding:"11px 16px",fontFamily:"monospace",fontSize:12,color:C.teal}}>{u.username}</td><td style={{padding:"11px 16px"}}><Badge label={u.role} color={u.role==="admin"?"teal":u.role==="accountant"?"gold":u.role==="staff"?"blue":"green"} C={C}/></td><td style={{padding:"11px 16px",fontSize:12,color:C.muted}}>{inst?.name?.slice(0,22)||"--"}</td><td style={{padding:"11px 16px"}}>{(()=>{const rec=inst&&(db.billing||[]).find(b=>b.instId===inst.id);const st=subState(rec,cfgR);return st?<div><Badge label={st.label} color={st.color} C={C}/>{rec.nextDue&&<div style={{fontSize:10,color:C.muted,marginTop:3}}>Due {fmt(rec.nextDue)}</div>}</div>:<span style={{fontSize:11,color:C.muted}}>{inst?"No plan":"--"}</span>;})()}</td><td style={{padding:"11px 16px"}}><div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{inst&&u.role==="admin"&&(()=>{const st=subState((db.billing||[]).find(b=>b.instId===inst.id),cfgR);return st&&st.key!=="ok"?<RemindBtn db={db} inst={inst} notify={notify} C={C}/>:null;})()}<Btn onClick={()=>setEditUser(u)} C={C} color="teal" size="sm" outline>Edit</Btn><Btn onClick={()=>{const np=window.prompt("New password:",u.password);if(np)onUpdate(u.id,{password:np});}} C={C} color="gold" size="sm" outline>Reset Pwd</Btn><Btn onClick={()=>{if(confirmDelete(u.name))onDelete(u.id);}} C={C} color="red" size="sm" outline>Delete</Btn></div></td></tr>;})}
+        {!db.users.filter(u=>u.role!=="superadmin").length&&<tr><td colSpan={6}><Empty msg="No users" C={C}/></td></tr>}</tbody>
       </table>
     </div>
     {editUser&&<EditModal title={`Edit user — ${editUser.name}`} C={C} value={editUser} onClose={()=>setEditUser(null)} onSave={v=>{
@@ -1421,6 +1423,49 @@ function SubReminderBanner({db,inst,C}){
       {cfg.upiId&&!upi&&<span style={{fontSize:11,color:C.muted}}>UPI: <b>{cfg.upiId}</b></span>}
       {waPhone&&<a href={`https://wa.me/${waPhone.length===10?"91"+waPhone:waPhone}?text=${encodeURIComponent(`Hi, this is ${inst.brandName||inst.name}. About our EduSphere subscription renewal.`)}`} target="_blank" rel="noreferrer" style={{padding:"6px 12px",borderRadius:8,border:`1px solid ${col}`,color:col,fontSize:12,fontWeight:700,textDecoration:"none"}}>WhatsApp us</a>}
       {canDismiss&&<button onClick={()=>{lsSet(dismissKey,today());setHidden(true);}} aria-label="Hide for today" style={{background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer",lineHeight:1}}>×</button>}
+    </div>
+  </div>;
+}
+// Small "📧 Remind" button with its own sending state (used on Users + Billing pages).
+function RemindBtn({db,inst,notify,C,label="📧 Remind"}){
+  const [busy,setBusy]=useState(false);
+  async function go(){
+    if(!instEmails(db,inst.id).length){notify(`${inst.brandName||inst.name} has no email on file. Add one under Institutions or Users.`,"error");return;}
+    setBusy(true);
+    try{const res=await sendBillingReminder(inst.id);notify(`📧 Reminder sent to ${(res&&res.to||[]).join(", ")||inst.name}`);}
+    catch(e){notify("Reminder not sent: "+(e.message||e),"error");}
+    finally{setBusy(false);}
+  }
+  return <Btn onClick={go} C={C} color="gold" size="sm" outline disabled={busy}>{busy?"Sending…":label}</Btn>;
+}
+// Panel listing institutions whose subscription is due soon, due today, overdue or suspended.
+function SubReminderPanel({db,notify,C,onOpenBilling}){
+  const cfg=remindCfg(db);
+  const log=toArr(db.reminderLog);
+  const rows=(db.institutions||[]).map(inst=>{const rec=(db.billing||[]).find(b=>b.instId===inst.id);return{inst,rec,st:subState(rec,cfg)};})
+    .filter(x=>x.st&&x.st.key!=="ok").sort((a,b)=>(a.st.days??0)-(b.st.days??0));
+  if(!rows.length)return null;
+  const red=rows.some(x=>x.st.color==="red");
+  const col=red?C.red:C.gold;
+  return <div style={{background:C.surface,borderRadius:10,border:`1px solid ${col}55`,borderLeft:`4px solid ${col}`,padding:"14px 18px",marginBottom:18,boxShadow:C.shadow}}>
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10,flexWrap:"wrap"}}>
+      <span style={{fontSize:18}}>{red?"⚠️":"🔔"}</span>
+      <div style={{flex:1,fontWeight:700,fontSize:14,color:C.text}}>Subscription reminders <span style={{fontWeight:500,fontSize:12,color:C.muted}}>· {rows.length} institution{rows.length===1?"":"s"} need attention</span></div>
+      {onOpenBilling&&<Btn onClick={onOpenBilling} C={C} color="teal" size="sm" outline>Open SaaS Billing</Btn>}
+    </div>
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {rows.map(({inst,rec,st})=>{const plan=PLANS.find(p=>p.k===rec.plan)||PLANS[0];const emails=instEmails(db,inst.id);
+        const ll=log.filter(l=>l.instId===inst.id).sort((a,b)=>String(b.at||"").localeCompare(String(a.at||"")))[0];
+        return <div key={inst.id} style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",padding:"8px 12px",background:C.bg,borderRadius:8,border:`1px solid ${C.border}`}}>
+          <div style={{flex:1,minWidth:180}}>
+            <div style={{fontWeight:600,fontSize:13,color:C.text}}>{inst.brandName||inst.name}</div>
+            <div style={{fontSize:11,color:C.muted}}>{plan.l} · ₹{Number(rec.price||0).toLocaleString()} · due {fmt(rec.nextDue)}
+              {ll&&<> · last reminder {fmt(String(ll.at||"").slice(0,10))}{ll.ok?"":" (failed)"}</>}
+              {!emails.length&&<span style={{color:C.red}}> · no email on file</span>}</div>
+          </div>
+          <Badge label={st.label} color={st.color} C={C}/>
+          <RemindBtn db={db} inst={inst} notify={notify} C={C}/>
+        </div>;})}
     </div>
   </div>;
 }
