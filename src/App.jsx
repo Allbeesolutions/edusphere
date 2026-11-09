@@ -1346,10 +1346,93 @@ const PLANS=[
   {k:"pro",l:"Professional",price:3999,cap:"Up to 750 students · all modules",color:"teal"},
   {k:"enterprise",l:"Enterprise",price:8999,cap:"Unlimited students · priority support",color:"purple"},
 ];
+// ── Subscription reminders ──────────────────────────────────────────────────
+// Settings live in db.settings.billingReminders. Emails are sent by the
+// Supabase Edge Function "send-reminder" (see supabase/functions/send-reminder);
+// it also runs once a day from pg_cron so reminders go out even if nobody clicks.
+const REMINDER_FN="send-reminder";
+const REMIND_DEFAULTS={daysBefore:"7,3,1",overdueEvery:3,autoEmail:"yes",contactPhone:"",upiId:"",payNote:""};
+function remindCfg(db){return{...REMIND_DEFAULTS,...((db&&db.settings&&db.settings.billingReminders)||{})};}
+function remindDays(cfg){return String(cfg.daysBefore||"").split(/[,\s]+/).map(Number).filter(n=>Number.isFinite(n)&&n>=0);}
+function daysUntil(d){if(!d)return null;const a=new Date(today()+"T00:00:00Z"),b=new Date(String(d).slice(0,10)+"T00:00:00Z");if(isNaN(b))return null;return Math.round((b-a)/86400000);}
+// Works out where a subscription stands from its due date, so "Overdue" shows
+// automatically even if nobody changed the status by hand.
+function subState(rec,cfg){
+  if(!rec)return null;
+  const days=daysUntil(rec.nextDue);
+  const warnAt=Math.max(7,...remindDays(cfg||REMIND_DEFAULTS));
+  if(rec.status==="Suspended")return{key:"suspended",days,label:"Suspended",color:"red"};
+  if(days===null)return{key:"ok",days,label:rec.status||"Active",color:"green"};
+  if(days<0)return{key:"overdue",days,label:`Overdue ${-days}d`,color:"red"};
+  if(days===0)return{key:"today",days,label:"Due today",color:"red"};
+  if(days<=warnAt)return{key:"soon",days,label:`Due in ${days}d`,color:"gold"};
+  return{key:"ok",days,label:rec.status||"Active",color:rec.status==="Trial"?"gold":"green"};
+}
+function instEmails(db,instId){
+  const inst=(db.institutions||[]).find(i=>i.id===instId);
+  const list=[inst&&inst.email,...(db.users||[]).filter(u=>u.instId===instId&&u.role==="admin").map(u=>u.email)];
+  const ok=e=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e||"").trim());
+  return[...new Set(list.filter(ok).map(e=>e.trim().toLowerCase()))];
+}
+async function sendBillingReminder(instId){
+  if(!supabase)throw new Error("Supabase isn't configured");
+  const {data,error}=await supabase.functions.invoke(REMINDER_FN,{body:{mode:"manual",instId}});
+  if(error){
+    let msg=error.message||"Request failed";
+    try{const j=await error.context.json();if(j&&j.error)msg=j.error;}catch(e){/* not JSON */}
+    if(/Failed to send a request|FunctionsFetchError/i.test(msg))msg="Email service not reachable. Deploy the send-reminder function first.";
+    throw new Error(msg);
+  }
+  if(data&&data.error)throw new Error(data.error);
+  return data;
+}
+// Banner shown inside the institution app to admins/accountants when the
+// subscription is about to expire, due today, overdue or suspended.
+function SubReminderBanner({db,inst,C}){
+  const rec=(db.billing||[]).find(b=>b.instId===inst.id);
+  const cfg=remindCfg(db);
+  const st=subState(rec,cfg);
+  const dismissKey="eduSubBanner_"+inst.id;
+  const [hidden,setHidden]=useState(()=>lsGet(dismissKey,"")===today());
+  if(!rec||!st||st.key==="ok")return null;
+  const canDismiss=st.key==="soon";
+  if(hidden&&canDismiss)return null;
+  const plan=PLANS.find(p=>p.k===rec.plan)||PLANS[0];
+  const isTrial=Number(rec.price||0)===0;
+  const amt=Number(rec.price||0);
+  const red=st.key!=="soon";
+  const col=red?C.red:C.gold;
+  const msg=st.key==="suspended"?"Your EduSphere subscription is suspended. Please renew to keep using all features."
+    :st.key==="overdue"?`Your ${plan.l} subscription payment is overdue by ${-st.days} day${st.days===-1?"":"s"} (was due ${fmt(rec.nextDue)}). Please renew to avoid interruption.`
+    :st.key==="today"?(isTrial?"Your free trial ends today. Choose a plan to continue.":`Your ${plan.l} subscription is due today.`)
+    :(isTrial?`Your free trial ends in ${st.days} day${st.days===1?"":"s"} (${fmt(rec.nextDue)}).`:`Your ${plan.l} subscription renews on ${fmt(rec.nextDue)}, ${st.days} day${st.days===1?"":"s"} left.`);
+  const upi=cfg.upiId&&amt>0?`upi://pay?pa=${encodeURIComponent(cfg.upiId)}&pn=${encodeURIComponent("EduSphere")}&am=${amt}&cu=INR&tn=${encodeURIComponent((inst.brandName||inst.name)+" subscription")}`:"";
+  const phone=String(cfg.contactPhone||"").replace(/[^\d+]/g,"");
+  const waPhone=phone.replace(/\D/g,"");
+  return <div role="status" style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",padding:"12px 16px",marginBottom:14,borderRadius:10,background:red?C.redL:(C.goldL||C.bg),border:`1px solid ${col}55`,borderLeft:`4px solid ${col}`}}>
+    <span style={{fontSize:20}}>{red?"⚠️":"🔔"}</span>
+    <div style={{flex:1,minWidth:200}}>
+      <div style={{fontWeight:700,fontSize:13,color:col}}>{red?"Subscription payment needed":"Subscription reminder"}</div>
+      <div style={{fontSize:12,color:C.text,marginTop:2}}>{msg}{amt>0&&<> Amount: <b>₹{amt.toLocaleString()}</b>.</>}</div>
+      {cfg.payNote&&<div style={{fontSize:11,color:C.muted,marginTop:3}}>{cfg.payNote}</div>}
+    </div>
+    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+      {upi&&<a href={upi} style={{padding:"6px 12px",borderRadius:8,background:col,color:"#fff",fontSize:12,fontWeight:700,textDecoration:"none"}}>Pay ₹{amt.toLocaleString()} via UPI</a>}
+      {cfg.upiId&&!upi&&<span style={{fontSize:11,color:C.muted}}>UPI: <b>{cfg.upiId}</b></span>}
+      {waPhone&&<a href={`https://wa.me/${waPhone.length===10?"91"+waPhone:waPhone}?text=${encodeURIComponent(`Hi, this is ${inst.brandName||inst.name}. About our EduSphere subscription renewal.`)}`} target="_blank" rel="noreferrer" style={{padding:"6px 12px",borderRadius:8,border:`1px solid ${col}`,color:col,fontSize:12,fontWeight:700,textDecoration:"none"}}>WhatsApp us</a>}
+      {canDismiss&&<button onClick={()=>{lsSet(dismissKey,today());setHidden(true);}} aria-label="Hide for today" style={{background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer",lineHeight:1}}>×</button>}
+    </div>
+  </div>;
+}
 function SABilling({db,saveDb,notify,C}){
   const billing=db.billing||[];
   const recFor=id=>billing.find(b=>b.instId===id);
   const planMeta=k=>PLANS.find(p=>p.k===k)||PLANS[0];
+  const cfg=remindCfg(db);
+  const log=toArr(db.reminderLog);
+  const lastLog=id=>log.filter(l=>l.instId===id).sort((a,b)=>String(b.at||"").localeCompare(String(a.at||"")))[0];
+  const [sending,setSending]=useState({});
+  const [editCfg,setEditCfg]=useState(false);
   function nextMonth(){const d=new Date();d.setMonth(d.getMonth()+1);return d.toISOString().slice(0,10);}
   function setPlan(instId,planK){
     const p=planMeta(planK);
@@ -1376,16 +1459,59 @@ function SABilling({db,saveDb,notify,C}){
     saveDb({billing:[...others,{...r,price:Number(v.price)||0,nextDue:v.nextDue,status:v.status}]});
     setEditBill(null);notify("Subscription saved");
   }
+  function saveCfg(v){
+    const days=remindDays(v);
+    if(!days.length){notify("Enter at least one day, e.g. 7,3,1","error");return;}
+    const clean={daysBefore:[...new Set(days)].sort((a,b)=>b-a).join(","),overdueEvery:Math.max(1,Number(v.overdueEvery)||3),autoEmail:v.autoEmail==="no"?"no":"yes",
+      contactPhone:String(v.contactPhone||"").trim(),upiId:String(v.upiId||"").trim(),payNote:String(v.payNote||"").trim()};
+    saveDb({settings:{...(db.settings||{}),billingReminders:clean}});
+    setEditCfg(false);notify("Reminder settings saved");
+  }
+  async function remind(inst){
+    if(!instEmails(db,inst.id).length){notify(`${inst.brandName||inst.name} has no email on file. Add one under Institutions or Users.`,"error");return;}
+    setSending(s=>({...s,[inst.id]:true}));
+    try{
+      const res=await sendBillingReminder(inst.id);
+      notify(`📧 Reminder sent to ${(res&&res.to||[]).join(", ")||inst.name}`);
+    }catch(e){notify("Reminder not sent: "+(e.message||e),"error");}
+    finally{setSending(s=>{const n={...s};delete n[inst.id];return n;});}
+  }
+  const states=db.institutions.map(inst=>({inst,rec:recFor(inst.id),st:subState(recFor(inst.id),cfg)}));
+  const dueList=states.filter(x=>x.st&&x.st.key!=="ok"&&x.st.key!=="suspended"&&instEmails(db,x.inst.id).length);
+  async function remindAll(){
+    if(!dueList.length)return;
+    if(!window.confirm(`Send a reminder email to ${dueList.length} institution${dueList.length===1?"":"s"}?`))return;
+    let ok=0,fail=0;
+    for(const x of dueList){
+      setSending(s=>({...s,[x.inst.id]:true}));
+      try{await sendBillingReminder(x.inst.id);ok++;}catch(e){fail++;}
+      finally{setSending(s=>{const n={...s};delete n[x.inst.id];return n;});}
+    }
+    notify(`📧 ${ok} reminder${ok===1?"":"s"} sent${fail?`, ${fail} failed`:""}`,fail?"error":"success");
+  }
   const active=billing.filter(b=>b.status==="Active");
   const mrr=active.reduce((a,b)=>a+Number(b.price||0),0);
-  const overdue=billing.filter(b=>b.status==="Overdue").length;
+  const overdue=states.filter(x=>x.st&&x.st.key==="overdue").length;
+  const dueSoon=states.filter(x=>x.st&&(x.st.key==="soon"||x.st.key==="today")).length;
   return <div style={{animation:"fadeUp 0.4s ease"}}>
     <PH title="💳 SaaS Billing" sub="Subscription plans, invoices & revenue across institutions" C={C}/>
-    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:20}}>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:14,marginBottom:20}}>
       <StatCard icon="💰" label="MRR" value={`₹${mrr.toLocaleString()}`} color="green" C={C} sub="Monthly recurring"/>
       <StatCard icon="✅" label="Active" value={active.length} color="teal" C={C} sub="Paid subscriptions"/>
       <StatCard icon="🏛" label="Institutions" value={db.institutions.length} color="blue" C={C} sub="Total accounts"/>
+      <StatCard icon="⏰" label="Due soon" value={dueSoon} color={dueSoon?"gold":"green"} C={C} sub="Within reminder window"/>
       <StatCard icon="⚠" label="Overdue" value={overdue} color={overdue?"red":"green"} C={C} sub="Need follow-up"/>
+    </div>
+    <div style={{background:C.surface,borderRadius:12,border:`1px solid ${C.border}`,padding:"14px 18px",boxShadow:C.shadow,marginBottom:20,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+      <div style={{flex:1,minWidth:220}}>
+        <div style={{fontWeight:700,fontSize:14,color:C.text}}>📧 Payment reminders</div>
+        <div style={{fontSize:11,color:C.muted,marginTop:2}}>
+          Auto email {cfg.autoEmail==="no"?<b style={{color:C.red}}>off</b>:<b style={{color:C.green}}>on</b>} · {remindDays(cfg).join(", ")} day(s) before due, then every {cfg.overdueEvery} day(s) while overdue · in-app banner for institution admins
+          {!cfg.upiId&&!cfg.contactPhone&&<span style={{color:C.gold}}> · add your UPI ID / phone so they can pay</span>}
+        </div>
+      </div>
+      <Btn onClick={()=>setEditCfg(true)} C={C} color="teal" size="sm" outline>⚙ Settings</Btn>
+      <Btn onClick={remindAll} C={C} color="gold" size="sm" disabled={!dueList.length||Object.keys(sending).length>0}>📧 Remind all due ({dueList.length})</Btn>
     </div>
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:12,marginBottom:22}}>
       {PLANS.map(p=><div key={p.k} style={{background:C.surface,borderRadius:12,border:`1px solid ${tc(C,p.color)}44`,padding:16,boxShadow:C.shadow,borderTop:`3px solid ${tc(C,p.color)}`}}>
@@ -1396,17 +1522,22 @@ function SABilling({db,saveDb,notify,C}){
     </div>
     <div style={{fontWeight:700,fontSize:14,marginBottom:12,color:C.text}}>Institution Subscriptions</div>
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
-      {db.institutions.map(inst=>{const r=recFor(inst.id);const p=r?planMeta(r.plan):null;const sc=db.students.filter(s=>s.instId===inst.id).length;return<div key={inst.id} style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"15px 18px",boxShadow:C.shadow,borderLeft:`4px solid ${inst.color}`}}>
+      {states.map(({inst,rec:r,st})=>{const p=r?planMeta(r.plan):null;const sc=db.students.filter(s=>s.instId===inst.id).length;const emails=instEmails(db,inst.id);const ll=lastLog(inst.id);return<div key={inst.id} style={{background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,padding:"15px 18px",boxShadow:C.shadow,borderLeft:`4px solid ${inst.color}`}}>
         <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
           <div style={{flex:1,minWidth:160}}>
             <div style={{fontWeight:700,fontSize:14,color:C.text}}>{inst.brandName||inst.name}</div>
             <div style={{fontSize:11,color:C.muted}}>{sc} students · {r?`Next due ${fmt(r.nextDue)}`:"No plan assigned"}</div>
+            {r&&<div style={{fontSize:10,color:emails.length?C.muted:C.red,marginTop:2}}>
+              {emails.length?`✉ ${emails.join(", ")}`:"✉ No email on file, reminders can't be emailed"}
+              {ll&&<span style={{color:ll.ok?C.muted:C.red}}> · Last reminder {fmt(String(ll.at||"").slice(0,10))} ({ll.kind==="auto"?"auto":"manual"}{ll.ok?"":", failed"})</span>}
+            </div>}
           </div>
-          {r&&<Badge label={r.status} color={r.status==="Active"?"green":r.status==="Trial"?"gold":r.status==="Overdue"?"red":"muted"} C={C}/>}
-          {p&&<div style={{textAlign:"center",padding:"5px 12px",background:C.bg,borderRadius:8,minWidth:90}}><div style={{fontWeight:800,fontSize:13,color:tc(C,p.color)}}>₹{p.price.toLocaleString()}</div><div style={{fontSize:9,color:C.muted}}>{p.l}</div></div>}
+          {r&&st&&<Badge label={st.label} color={st.color} C={C}/>}
+          {p&&<div style={{textAlign:"center",padding:"5px 12px",background:C.bg,borderRadius:8,minWidth:90}}><div style={{fontWeight:800,fontSize:13,color:tc(C,p.color)}}>₹{Number(r.price??p.price).toLocaleString()}</div><div style={{fontSize:9,color:C.muted}}>{p.l}</div></div>}
           <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
             <Sel C={C} value={r?.plan||""} onChange={e=>setPlan(inst.id,e.target.value)} style={{width:"auto",padding:"6px 10px",fontSize:12}}><option value="" disabled>Set plan…</option>{PLANS.map(pl=><option key={pl.k} value={pl.k}>{pl.l}</option>)}</Sel>
             {r&&<Btn onClick={()=>markPaid(inst.id)} C={C} color="green" size="sm">Mark Paid</Btn>}
+            {r&&<Btn onClick={()=>remind(inst)} C={C} color="gold" size="sm" outline disabled={!!sending[inst.id]}>{sending[inst.id]?"Sending…":"📧 Remind"}</Btn>}
             {r&&<Btn onClick={()=>setEditBill(r)} C={C} color="teal" size="sm" outline>Edit</Btn>}
             {r&&r.status!=="Suspended"&&<Btn onClick={()=>setStatus(inst.id,"Suspended")} C={C} color="red" size="sm" outline>Suspend</Btn>}
             {r&&r.status==="Suspended"&&<Btn onClick={()=>setStatus(inst.id,"Active")} C={C} color="green" size="sm" outline>Reactivate</Btn>}
@@ -1422,6 +1553,16 @@ function SABilling({db,saveDb,notify,C}){
     {editBill&&<EditModal title="Edit subscription" C={C} value={editBill} onClose={()=>setEditBill(null)} onSave={saveBill} fields={[
       {k:"price",label:"Price per month (₹)",type:"number"},{k:"nextDue",label:"Next due date",type:"date"},
       {k:"status",label:"Status",type:"select",span:true,options:["Active","Trial","Overdue","Suspended"]},
+    ]}/>}
+    {editCfg&&<EditModal title="Payment reminder settings" C={C} value={cfg} onClose={()=>setEditCfg(false)} onSave={saveCfg} saveLabel="Save settings"
+      danger="Auto emails go out once a day (about 9 AM IST) from the send-reminder function. Each institution's email and its admin users' emails receive them."
+      fields={[
+      {k:"daysBefore",label:"Remind days before due",placeholder:"7,3,1"},
+      {k:"overdueEvery",label:"When overdue, repeat every (days)",type:"number"},
+      {k:"autoEmail",label:"Automatic daily emails",type:"select",options:[["yes","On"],["no","Off (manual only)"]]},
+      {k:"contactPhone",label:"Your contact / WhatsApp number",placeholder:"9876543210"},
+      {k:"upiId",label:"UPI ID for payment",placeholder:"allbee@okaxis",span:true},
+      {k:"payNote",label:"Extra payment note (shown in banner and email)",type:"textarea",rows:2,placeholder:"Bank: ... · A/C: ... · IFSC: ..."},
     ]}/>}
   </div>;
 }
@@ -3276,6 +3417,7 @@ function InstDash({db,saveDb,onLogout,notify,user,inst,C,dark,setDark}){
       {/* Main content */}
       <div className="inst-content">
        <ErrorBoundary C={C} resetKey={tab}>
+        {(isAdmin||user.role==="accountant")&&<SubReminderBanner db={db} inst={inst} C={C}/>}
         {/* Mobile breadcrumb */}
         <div className="breadcrumb-bar" style={{background:C.surface,border:`1px solid ${C.border}`}}>
           <span style={{fontSize:16}}>{curTab?.i}</span>
